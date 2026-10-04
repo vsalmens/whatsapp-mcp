@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+          cache-dependency-path: whatsapp-bridge/go.sum
+      - name: Build bridge
+        working-directory: whatsapp-bridge
+        run: go build ./...
+      - name: Vet (informational)
+        working-directory: whatsapp-bridge
+        run: go vet ./... || true
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Sync and byte-compile MCP server
+        working-directory: whatsapp-mcp-server
+        run: |
+          uv sync
+          uv run python -m py_compile main.py whatsapp.py whatsapp_extras.py
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for f in scripts/*.sh deploy/post-receive; do bash -n "$f"; done

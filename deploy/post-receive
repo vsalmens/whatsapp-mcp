@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# post-receive — deploy hook for a bare repo on the bridge host.
+#
+#   git push <host> main  →  checkout into the working tree → build → restart launchd services
+#
+# If the build fails, the working tree is reverted and the services keep running the old binary.
+# store/ is git-ignored, so deploys never touch the message database or the device keys.
+#
+# Install on the bridge host:
+#   git init --bare ~/repos/whatsapp-mcp.git
+#   cp deploy/post-receive ~/repos/whatsapp-mcp.git/hooks/ && chmod +x ~/repos/whatsapp-mcp.git/hooks/post-receive
+# Set WORK and LABEL_PREFIX below (or in the environment) to match your setup.
+set -uo pipefail
+WORK="${WORK:-$HOME/Projects/whatsapp-mcp}"
+LABEL_PREFIX="${LABEL_PREFIX:-local.whatsapp-mcp}"
+BRANCH="main"
+UIDN="$(id -u)"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+ZERO="0000000000000000000000000000000000000000"
+
+while read -r old new ref; do
+  [[ "$ref" == "refs/heads/$BRANCH" ]] || continue
+  echo "→ deploying $(git rev-parse --short "$new") to $WORK"
+  git --work-tree="$WORK" checkout -f "$BRANCH" || { echo "✗ checkout failed"; exit 1; }
+
+  ok=1
+  ( cd "$WORK/whatsapp-bridge" && go build -o whatsapp-bridge.new . ) || ok=0
+  if (( ok )); then
+    ( cd "$WORK/whatsapp-mcp-server" && uv sync -q && uv run python -m py_compile main.py whatsapp_extras.py ) || ok=0
+  fi
+
+  if (( ok )); then
+    mv "$WORK/whatsapp-bridge/whatsapp-bridge.new" "$WORK/whatsapp-bridge/whatsapp-bridge"
+    launchctl kickstart -k "gui/$UIDN/$LABEL_PREFIX.bridge" && echo "✓ bridge restarted"
+    launchctl kickstart -k "gui/$UIDN/$LABEL_PREFIX.mcp"    && echo "✓ MCP server restarted"
+    sleep 5
+    tail -n 5 "$HOME/Library/Logs/whatsapp-bridge.log" 2>/dev/null | sed 's/^/   log: /'
+    echo "✓ deployed $(git rev-parse --short "$new")"
+  else
+    rm -f "$WORK/whatsapp-bridge/whatsapp-bridge.new"
+    echo "✗ build or check failed — services keep running the previous version"
+    if [[ "$old" != "$ZERO" ]]; then
+      git --work-tree="$WORK" checkout -f "$old" -- . && echo "↩ working tree reverted to $(git rev-parse --short "$old")"
+    fi
+    exit 1
+  fi
+done

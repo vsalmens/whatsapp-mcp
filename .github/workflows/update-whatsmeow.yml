@@ -1,0 +1,40 @@
+# Daily: bump whatsmeow (the WhatsApp protocol library) to its latest commit and open a PR.
+# If the build breaks, the run fails and GitHub notifies you — an early warning that the
+# extras need adapting to a whatsmeow API change.
+# Requires: Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests".
+name: Update whatsmeow
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+      - name: Update and build
+        working-directory: whatsapp-bridge
+        run: |
+          before=$(go list -m -f '{{.Version}}' go.mau.fi/whatsmeow)
+          go get go.mau.fi/whatsmeow@main
+          go mod tidy
+          go build ./...
+          after=$(go list -m -f '{{.Version}}' go.mau.fi/whatsmeow)
+          echo "BEFORE=$before" >> "$GITHUB_ENV"
+          echo "AFTER=$after" >> "$GITHUB_ENV"
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          branch: deps/whatsmeow
+          delete-branch: true
+          title: "deps: whatsmeow ${{ env.AFTER }}"
+          commit-message: "deps: update whatsmeow ${{ env.BEFORE }} -> ${{ env.AFTER }}"
+          body: |
+            Automated whatsmeow update (${{ env.BEFORE }} → ${{ env.AFTER }}). The bridge builds.
+            Upstream changes: https://github.com/tulir/whatsmeow/commits/main
+            After merging, deploy to the bridge host and check the bridge log.

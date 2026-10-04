@@ -1,0 +1,11 @@
+# CLAUDE.local.md  (copy to CLAUDE.local.md — git-ignored, machine-specific)
+
+## Deployment
+- Bridge host: SSH alias `<alias>` (configured in ~/.ssh/config).
+- Deploy: `git push <alias> main` (bare repo with deploy/post-receive on the host).
+- launchd labels on the host: `<prefix>.bridge`, `<prefix>.mcp`.
+- Logs on the host: `ssh <alias> tail -50 ~/Library/Logs/whatsapp-bridge.log`
+
+## This machine
+- This is a development machine: never run `whatsapp-bridge` here with a copy of the production store.
+- A separate dev link (its own store, scanned with a QR code) is allowed for testing.

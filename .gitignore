@@ -1,3 +1,23 @@
-*.db
-claude_desktop_config.json
-whatsapp.log
+# --- NEVER commit: message database and WhatsApp device keys ---
+whatsapp-bridge/store/
+store/
+
+# Build output and environments
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/whatsapp-bridge.new
+whatsapp-mcp-server/.venv/
+**/__pycache__/
+
+# Backups written by scripts
+*.bak
+*.prev
+go.mod.prev
+go.sum.prev
+
+# Debug logs may contain message content
+*.log
+
+.DS_Store
+
+# Local, machine-specific notes for Claude Code (never commit)
+CLAUDE.local.md

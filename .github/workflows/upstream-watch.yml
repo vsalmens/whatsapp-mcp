@@ -1,0 +1,37 @@
+# Saturday digest of activity in the upstream repo (new commits and updated PRs), opened as an
+# issue so useful fixes from others can be reviewed and cherry-picked.
+# Requires issues to be enabled on the fork (Settings → General → Features → Issues).
+name: Watch upstream
+on:
+  schedule:
+    - cron: "0 6 * * 6"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect upstream activity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: lharries/whatsapp-mcp
+        run: |
+          since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "Activity in [$UPSTREAM](https://github.com/$UPSTREAM) since $since"
+            echo
+            echo "### New commits on the default branch"
+            gh api "repos/$UPSTREAM/commits?since=$since" \
+              --jq '.[] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0]) — \(.commit.author.name)"' || true
+            echo
+            echo "### Pull requests updated"
+            gh api "repos/$UPSTREAM/pulls?state=all&sort=updated&direction=desc&per_page=50" \
+              --jq ".[] | select(.updated_at > \"$since\") | \"- [#\(.number)](\(.html_url)) \(.title) — @\(.user.login) (\(.state))\"" || true
+          } > report.md
+          if grep -q '^- ' report.md; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Upstream activity $(date -u +%Y-%m-%d)" --body-file report.md
+          else
+            echo "No upstream activity this week."
+          fi
