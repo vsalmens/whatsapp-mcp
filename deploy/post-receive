@@ -42,11 +42,18 @@ while read -r old new ref; do
 
   if (( ok )); then
     mv "$WORK/whatsapp-bridge/whatsapp-bridge.new" "$WORK/whatsapp-bridge/whatsapp-bridge"
-    launchctl kickstart -k "gui/$UIDN/$BRIDGE_LABEL" && echo "✓ bridge restarted"
-    launchctl kickstart -k "gui/$UIDN/$MCP_LABEL" && echo "✓ MCP server restarted"
+    restarted=1
+    for label in "$BRIDGE_LABEL" "$MCP_LABEL"; do
+      launchctl kickstart -k "gui/$UIDN/$label" && echo "✓ restarted $label" || { echo "✗ could not restart $label"; restarted=0; }
+    done
     sleep 5
     tail -n 5 "$HOME/Library/Logs/whatsapp-bridge.log" 2>/dev/null | sed 's/^/   log: /'
-    echo "✓ deployed $(git rev-parse --short "$new")"
+    if (( restarted )); then
+      echo "✓ deployed $(git rev-parse --short "$new")"
+    else
+      echo "⚠ deployed $(git rev-parse --short "$new"), but services were not restarted (check labels: deploy.labelPrefix)"
+      exit 1
+    fi
   else
     rm -f "$WORK/whatsapp-bridge/whatsapp-bridge.new"
     echo "✗ build or check failed — services keep running the previous version"
