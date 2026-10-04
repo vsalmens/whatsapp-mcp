@@ -10,9 +10,14 @@
 #   git init --bare ~/repos/whatsapp-mcp.git
 #   cp deploy/post-receive ~/repos/whatsapp-mcp.git/hooks/ && chmod +x ~/repos/whatsapp-mcp.git/hooks/post-receive
 # Set WORK and LABEL_PREFIX below (or in the environment) to match your setup.
+# Labels that don't follow <prefix>.bridge / <prefix>.mcp can be set in the bare repo's config:
+#   git -C ~/repos/whatsapp-mcp.git config deploy.bridgeLabel <label>
+#   git -C ~/repos/whatsapp-mcp.git config deploy.mcpLabel <label>
 set -uo pipefail
 WORK="${WORK:-$HOME/Projects/whatsapp-mcp}"
 LABEL_PREFIX="${LABEL_PREFIX:-local.whatsapp-mcp}"
+BRIDGE_LABEL="${BRIDGE_LABEL:-$(git config --get deploy.bridgeLabel || echo "$LABEL_PREFIX.bridge")}"
+MCP_LABEL="${MCP_LABEL:-$(git config --get deploy.mcpLabel || echo "$LABEL_PREFIX.mcp")}"
 BRANCH="main"
 UIDN="$(id -u)"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -31,8 +36,8 @@ while read -r old new ref; do
 
   if (( ok )); then
     mv "$WORK/whatsapp-bridge/whatsapp-bridge.new" "$WORK/whatsapp-bridge/whatsapp-bridge"
-    launchctl kickstart -k "gui/$UIDN/$LABEL_PREFIX.bridge" && echo "✓ bridge restarted"
-    launchctl kickstart -k "gui/$UIDN/$LABEL_PREFIX.mcp"    && echo "✓ MCP server restarted"
+    launchctl kickstart -k "gui/$UIDN/$BRIDGE_LABEL" && echo "✓ bridge restarted"
+    launchctl kickstart -k "gui/$UIDN/$MCP_LABEL" && echo "✓ MCP server restarted"
     sleep 5
     tail -n 5 "$HOME/Library/Logs/whatsapp-bridge.log" 2>/dev/null | sed 's/^/   log: /'
     echo "✓ deployed $(git rev-parse --short "$new")"

@@ -9,6 +9,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="$REPO/whatsapp-bridge"
 LABEL_PREFIX="${LABEL_PREFIX:-local.whatsapp-mcp}"
+BRIDGE_LABEL="${BRIDGE_LABEL:-$LABEL_PREFIX.bridge}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 cd "$BRIDGE"
 cp go.mod go.mod.prev && cp go.sum go.sum.prev
@@ -18,7 +19,7 @@ if go get go.mau.fi/whatsmeow@main && go mod tidy && go build -o whatsapp-bridge
   mv whatsapp-bridge.new whatsapp-bridge && rm -f go.mod.prev go.sum.prev
   echo "✓ whatsmeow $before → $after"
   if [[ "${RESTART:-0}" == 1 ]]; then
-    launchctl kickstart -k "gui/$(id -u)/$LABEL_PREFIX.bridge" && echo "✓ bridge restarted"
+    launchctl kickstart -k "gui/$(id -u)/$BRIDGE_LABEL" && echo "✓ bridge restarted"
   fi
 else
   mv go.mod.prev go.mod && mv go.sum.prev go.sum && rm -f whatsapp-bridge.new

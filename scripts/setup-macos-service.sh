@@ -9,6 +9,8 @@
 #
 # Environment (all optional):
 #   LABEL_PREFIX  launchd label prefix              (default: local.whatsapp-mcp)
+#   BRIDGE_LABEL  full bridge label                 (default: <prefix>.bridge)
+#   MCP_LABEL     full MCP server label             (default: <prefix>.mcp)
 #   MCP_PORT      MCP HTTP port                     (default: 8001)
 #   BIND_IP       IP the MCP server listens on      (default: this machine's Tailscale IPv4)
 #   BIND_NAME     extra allowed Host name           (default: this machine's Tailscale DNS name)
@@ -17,13 +19,15 @@
 #   1) makes sure the bridge REST API listens on 127.0.0.1 only
 #   2) records this machine as the owner of the device keys (store/.host, see host_guard.go)
 #   3) builds the bridge and syncs the Python environment
-#   4) installs two LaunchAgents: <prefix>.bridge and <prefix>.mcp
+#   4) installs two LaunchAgents: $BRIDGE_LABEL and $MCP_LABEL
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="$REPO/whatsapp-bridge"
 SERVER="$REPO/whatsapp-mcp-server"
 LABEL_PREFIX="${LABEL_PREFIX:-local.whatsapp-mcp}"
+BRIDGE_LABEL="${BRIDGE_LABEL:-$LABEL_PREFIX.bridge}"
+MCP_LABEL="${MCP_LABEL:-$LABEL_PREFIX.mcp}"
 MCP_PORT="${MCP_PORT:-8001}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 UV="$(command -v uv)"     || { echo "✗ uv not found (brew install uv)"; exit 1; }
@@ -66,11 +70,11 @@ echo "✓ store/.host = $(cat "$BRIDGE/store/.host")"
 mkdir -p "$LA" "$LOGS"
 ALLOWED="$BIND_IP:*${BIND_NAME:+,$BIND_NAME:*}"
 
-cat > "$LA/$LABEL_PREFIX.bridge.plist" <<PLIST
+cat > "$LA/$BRIDGE_LABEL.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>$LABEL_PREFIX.bridge</string>
+  <key>Label</key><string>$BRIDGE_LABEL</string>
   <key>WorkingDirectory</key><string>$BRIDGE</string>
   <key>ProgramArguments</key><array><string>$BRIDGE/whatsapp-bridge</string></array>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
@@ -80,11 +84,11 @@ cat > "$LA/$LABEL_PREFIX.bridge.plist" <<PLIST
 </dict></plist>
 PLIST
 
-cat > "$LA/$LABEL_PREFIX.mcp.plist" <<PLIST
+cat > "$LA/$MCP_LABEL.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>$LABEL_PREFIX.mcp</string>
+  <key>Label</key><string>$MCP_LABEL</string>
   <key>ProgramArguments</key><array>
     <string>$UV</string><string>--directory</string><string>$SERVER</string><string>run</string><string>main.py</string>
   </array>
@@ -102,11 +106,11 @@ cat > "$LA/$LABEL_PREFIX.mcp.plist" <<PLIST
 </dict></plist>
 PLIST
 
-for svc in bridge mcp; do
-  launchctl bootout "gui/$(id -u)/$LABEL_PREFIX.$svc" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$LA/$LABEL_PREFIX.$svc.plist"
+for label in "$BRIDGE_LABEL" "$MCP_LABEL"; do
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$LA/$label.plist"
 done
-echo "✓ LaunchAgents loaded ($LABEL_PREFIX.bridge, $LABEL_PREFIX.mcp)"
+echo "✓ LaunchAgents loaded ($BRIDGE_LABEL, $MCP_LABEL)"
 
 cat <<TXT
 
