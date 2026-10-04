@@ -6,18 +6,23 @@
 # If the build fails, the working tree is reverted and the services keep running the old binary.
 # store/ is git-ignored, so deploys never touch the message database or the device keys.
 #
-# Install on the bridge host:
-#   git init --bare ~/repos/whatsapp-mcp.git
-#   cp deploy/post-receive ~/repos/whatsapp-mcp.git/hooks/ && chmod +x ~/repos/whatsapp-mcp.git/hooks/post-receive
-# Set WORK and LABEL_PREFIX below (or in the environment) to match your setup.
-# Labels that don't follow <prefix>.bridge / <prefix>.mcp can be set in the bare repo's config:
-#   git -C ~/repos/whatsapp-mcp.git config deploy.bridgeLabel <label>
-#   git -C ~/repos/whatsapp-mcp.git config deploy.mcpLabel <label>
+# Install on the bridge host (any location; the working tree defaults to the bare repo's
+# path without ".git", e.g. ~/Services/whatsapp-mcp.git -> ~/Services/whatsapp-mcp):
+#   git init --bare ~/Services/whatsapp-mcp.git
+#   cp deploy/post-receive ~/Services/whatsapp-mcp.git/hooks/ && chmod +x ~/Services/whatsapp-mcp.git/hooks/post-receive
+#
+# Per-host settings live in the bare repo's config (a push carries no environment):
+#   git -C <bare repo> config deploy.work        <dir>     # working tree (default: see above)
+#   git -C <bare repo> config deploy.labelPrefix <prefix>  # launchd labels <prefix>.bridge / <prefix>.mcp
+#   git -C <bare repo> config deploy.bridgeLabel <label>   # full labels, if they don't follow the prefix
+#   git -C <bare repo> config deploy.mcpLabel    <label>
 set -uo pipefail
-WORK="${WORK:-$HOME/Projects/whatsapp-mcp}"
-LABEL_PREFIX="${LABEL_PREFIX:-local.whatsapp-mcp}"
-BRIDGE_LABEL="${BRIDGE_LABEL:-$(git config --get deploy.bridgeLabel || echo "$LABEL_PREFIX.bridge")}"
-MCP_LABEL="${MCP_LABEL:-$(git config --get deploy.mcpLabel || echo "$LABEL_PREFIX.mcp")}"
+cfg(){ git config --get "deploy.$1" || echo "$2"; }
+GIT_ROOT="$(git rev-parse --absolute-git-dir)"
+WORK="${WORK:-$(cfg work "${GIT_ROOT%.git}")}"
+LABEL_PREFIX="${LABEL_PREFIX:-$(cfg labelPrefix local.whatsapp-mcp)}"
+BRIDGE_LABEL="${BRIDGE_LABEL:-$(cfg bridgeLabel "$LABEL_PREFIX.bridge")}"
+MCP_LABEL="${MCP_LABEL:-$(cfg mcpLabel "$LABEL_PREFIX.mcp")}"
 BRANCH="main"
 UIDN="$(id -u)"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -26,6 +31,7 @@ ZERO="0000000000000000000000000000000000000000"
 while read -r old new ref; do
   [[ "$ref" == "refs/heads/$BRANCH" ]] || continue
   echo "→ deploying $(git rev-parse --short "$new") to $WORK"
+  mkdir -p "$WORK"
   git --work-tree="$WORK" checkout -f "$BRANCH" || { echo "✗ checkout failed"; exit 1; }
 
   ok=1
@@ -45,7 +51,11 @@ while read -r old new ref; do
     rm -f "$WORK/whatsapp-bridge/whatsapp-bridge.new"
     echo "✗ build or check failed — services keep running the previous version"
     if [[ "$old" != "$ZERO" ]]; then
-      git --work-tree="$WORK" checkout -f "$old" -- . && echo "↩ working tree reverted to $(git rev-parse --short "$old")"
+      # Reset index + working tree to the old commit (also removes files added by the bad push)
+      # and move the branch back, so the bare repo reflects what is actually deployed.
+      git --work-tree="$WORK" read-tree -u --reset "$old" \
+        && git update-ref "refs/heads/$BRANCH" "$old" "$new" \
+        && echo "↩ working tree and $BRANCH reverted to $(git rev-parse --short "$old")"
     fi
     exit 1
   fi
