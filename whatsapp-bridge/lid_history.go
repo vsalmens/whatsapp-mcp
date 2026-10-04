@@ -46,6 +46,8 @@ func startExtras(client *whatsmeow.Client, store *MessageStore, logger waLog.Log
 		logger.Errorf("extras: failed to create lid_names table: %v", err)
 	}
 
+	startOnDemandHistoryLogging(client, logger)
+
 	http.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		handleHistoryRequest(client, store, logger, w, r)
 	})
@@ -251,8 +253,15 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 			SELECT id, timestamp, is_from_me FROM messages
 			WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1`, req.ChatJID).Scan(&oldestID, &oldestTS, &fromMe)
 	}
+	// Experimental: with no stored messages there is no anchor. Send the request without one
+	// (empty ID, current time) and let the phone decide; the outcome is only visible in the log.
+	anchorless := false
+	if err == sql.ErrNoRows && req.AnchorMessageID == "" {
+		anchorless, err = true, nil
+		oldestID, oldestTS, fromMe = "", time.Now(), false
+	}
 	if err == sql.ErrNoRows {
-		writeExtrasJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "no stored messages in this chat, so there is no anchor for the request"})
+		writeExtrasJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "anchor message not found in this chat"})
 		return
 	} else if err != nil {
 		writeExtrasJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "database error: " + err.Error()})
@@ -271,15 +280,32 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if _, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(info, req.Count)); err != nil {
+	sent, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(info, req.Count))
+	if err != nil {
 		logger.Warnf("extras: history request failed (%s): %v", req.ChatJID, err)
 		writeExtrasJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "failed to send the request to the phone: " + err.Error()})
 		return
 	}
 
-	logger.Infof("extras: requested %d messages before %s in %s", req.Count, oldestTS.Format(time.RFC3339), req.ChatJID)
+	if anchorless {
+		logger.Infof("extras: requested %d messages in %s WITHOUT anchor (experimental: is_group=%v, timestamp=%s, request_id=%s)",
+			req.Count, req.ChatJID, info.IsGroup, oldestTS.Format(time.RFC3339), sent.ID)
+		writeExtrasJSON(w, http.StatusOK, map[string]any{
+			"success":      true,
+			"status":       "sent_without_anchor",
+			"experimental": true,
+			"message": "No stored messages in this chat, so the request was sent without an anchor message (experimental). " +
+				"The phone may ignore or reject it: check list_messages after 10-30 seconds; the bridge log shows the phone's response code.",
+			"requested":  req.Count,
+			"request_id": sent.ID,
+		})
+		return
+	}
+
+	logger.Infof("extras: requested %d messages before %s in %s (request_id=%s)", req.Count, oldestTS.Format(time.RFC3339), req.ChatJID, sent.ID)
 	writeExtrasJSON(w, http.StatusOK, map[string]any{
 		"success":      true,
+		"status":       "sent",
 		"message":      "Request sent to the phone. Messages arrive asynchronously (usually within seconds; the phone must be online).",
 		"requested":    req.Count,
 		"oldest_known": oldestTS.Format(time.RFC3339), // timestamp of the anchor message

@@ -120,6 +120,10 @@ def _register_tools(mcp) -> None:
         back. The phone must be online. The request is sent only to the user's
         own devices, never to other people.
 
+        If the chat has no stored messages at all, the request is sent without an
+        anchor (status "sent_without_anchor", experimental): the phone may ignore it,
+        so verify with list_messages instead of assuming success.
+
         Args:
             chat_jid: JID of the chat (e.g. 123456789012345678@g.us or 15551234567@s.whatsapp.net)
             count: number of messages to request (default 50)
