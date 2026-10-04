@@ -461,11 +461,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		// Log metadata only: the log is plain text outside the database, so no message text or file names
+		if mediaType != "" || content != "" {
+			fmt.Printf("[%s] %s %s in %s: %s, %d chars\n", timestamp, direction, sender, msg.Info.Chat, logKind(mediaType), len([]rune(content)))
 		}
 	}
 }
@@ -1073,9 +1071,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
 					continue
@@ -1132,14 +1127,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
+					// Log metadata only (no message text or file names)
+					logger.Debugf("Stored message: [%s] %s -> %s: %s, %d chars",
+						timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, logKind(mediaType), len([]rune(content)))
 				}
 			}
 		}
@@ -1346,4 +1336,12 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// logKind describes a message for the log without revealing its content.
+func logKind(mediaType string) string {
+	if mediaType == "" {
+		return "text"
+	}
+	return mediaType
 }
