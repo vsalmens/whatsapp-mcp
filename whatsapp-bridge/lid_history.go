@@ -199,7 +199,53 @@ func refreshLIDNames(client *whatsmeow.Client, store *MessageStore, logger waLog
 			}
 		}
 	}
+	renamed += renamePNChats(ctx, client, store, logger)
 	return resolved, renamed
+}
+
+// renamePNChats names phone-number chats that still show a raw number. Upstream names a chat
+// only when it is first stored, often before the phone has synced contacts, and never again.
+// Like the LID pass, it only replaces names that are raw IDs, never manually set names.
+func renamePNChats(ctx context.Context, client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) (renamed int) {
+	rows, err := store.db.Query(`
+		SELECT jid FROM chats
+		WHERE jid LIKE '%@' || ? AND (name IS NULL OR name = '' OR name = jid OR name = substr(jid, 1, instr(jid, '@') - 1))`,
+		types.DefaultUserServer)
+	if err != nil {
+		logger.Warnf("extras: failed to query unnamed chats: %v", err)
+		return 0
+	}
+	var jids []types.JID
+	for rows.Next() {
+		var s string
+		if rows.Scan(&s) != nil {
+			continue
+		}
+		if jid, err := types.ParseJID(s); err == nil {
+			jids = append(jids, jid)
+		}
+	}
+	rows.Close()
+
+	for _, jid := range jids {
+		name := contactDisplayName(ctx, client, jid)
+		if client.Store.ID != nil && jid.User == client.Store.ID.User {
+			name = SelfChatName
+		}
+		if name == "" {
+			continue
+		}
+		res, err := store.db.Exec(`
+			UPDATE chats SET name = ?
+			WHERE jid = ? AND (name IS NULL OR name = '' OR name = jid OR name = ?)`,
+			name, jid.String(), jid.User)
+		if err == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				renamed += int(n)
+			}
+		}
+	}
+	return renamed
 }
 
 func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger, w http.ResponseWriter, r *http.Request) {
