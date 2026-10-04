@@ -154,7 +154,7 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@mcp.tool()
+###VS @mcp.tool()
 def send_message(
     recipient: str,
     message: str
@@ -183,7 +183,7 @@ def send_message(
         "message": status_message
     }
 
-@mcp.tool()
+##VS @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -203,7 +203,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         "message": status_message
     }
 
-@mcp.tool()
+##VS @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     
@@ -246,6 +246,21 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+# --- extras: LID-nimet + historiahaku ---
+import whatsapp_extras
+whatsapp_extras.register(mcp)
+
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    import os
+    if os.environ.get("MCP_TRANSPORT", "stdio") == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        from mcp.server.transport_security import TransportSecuritySettings
+        mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.environ.get("MCP_PORT", "8001"))
+        extra = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*"] + extra,
+        )
+        mcp.run(transport="streamable-http")
