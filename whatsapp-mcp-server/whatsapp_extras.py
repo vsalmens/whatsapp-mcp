@@ -22,6 +22,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import requests
@@ -77,6 +78,53 @@ def get_sender_name(sender_jid: str) -> str:
 _wa.get_sender_name = get_sender_name
 
 
+def list_chats(query: Optional[str] = None, limit: int = 20, page: int = 0,
+               include_last_message: bool = True, sort_by: str = "last_active"):
+    """Fixed version of whatsapp.list_chats.
+
+    Upstream selects messages.* even when the JOIN is left out (include_last_message=False),
+    which fails with "no such column" and silently returns [], and joins on timestamp
+    equality, which lists a chat twice when two messages share its last timestamp.
+    Here the page of chats is selected first and at most one last message is joined per chat.
+    """
+    where, params = "", []
+    if query:
+        where = "WHERE (LOWER(name) LIKE LOWER(?) OR jid LIKE ?)"
+        params += [f"%{query}%", f"%{query}%"]
+    order = "last_message_time DESC, name" if sort_by == "last_active" else "name"
+    params += [limit, page * limit]
+
+    if include_last_message:
+        last = """LEFT JOIN messages m ON m.rowid = (
+                      SELECT rowid FROM messages WHERE chat_jid = c.jid ORDER BY timestamp DESC LIMIT 1)"""
+        cols = "m.content, m.sender, m.is_from_me"
+    else:
+        last, cols = "", "NULL, NULL, NULL"
+
+    sql = f"""
+        SELECT c.jid, c.name, c.last_message_time, {cols}
+        FROM (SELECT jid, name, last_message_time FROM chats {where}
+              ORDER BY {order} LIMIT ? OFFSET ?) c
+        {last}
+        ORDER BY {"c.last_message_time DESC, c.name" if sort_by == "last_active" else "c.name"}"""
+    conn = sqlite3.connect(_wa.MESSAGES_DB_PATH)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [
+        _wa.Chat(
+            jid=r[0], name=r[1],
+            last_message_time=datetime.fromisoformat(r[2]) if r[2] else None,
+            last_message=r[3], last_sender=r[4], last_is_from_me=r[5],
+        )
+        for r in rows
+    ]
+
+
+_wa.list_chats = list_chats
+
+
 def _post(path: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 40) -> Dict[str, Any]:
     try:
         resp = requests.post(f"{_wa.WHATSAPP_API_BASE_URL}/{path}", json=payload or {}, timeout=timeout)
@@ -109,6 +157,7 @@ def register(mcp) -> None:
 
 def _register_tools(mcp) -> None:
     _register_download(mcp)
+    _register_list_chats(mcp)
 
     @mcp.tool()
     def request_older_messages(chat_jid: str, count: int = 50, from_newest: bool = False) -> Dict[str, Any]:
@@ -295,14 +344,38 @@ def _shrink_image(path: str) -> str:
         return path
 
 
-def _register_download(mcp) -> None:
+def _remove_tool(mcp, name: str) -> None:
     try:
-        mcp.remove_tool("download_media")
+        mcp.remove_tool(name)
     except Exception:
         try:
-            mcp._tool_manager._tools.pop("download_media", None)
+            mcp._tool_manager._tools.pop(name, None)
         except Exception:
             pass
+
+
+def _register_list_chats(mcp) -> None:
+    # main.py imported upstream list_chats by name, so replace the tool, not just the function
+    _remove_tool(mcp, "list_chats")
+
+    @mcp.tool()
+    def list_chats(query: Optional[str] = None, limit: int = 20, page: int = 0,
+                   include_last_message: bool = True, sort_by: str = "last_active"):
+        """Get WhatsApp chats matching specified criteria.
+
+        Args:
+            query: Optional search term to filter chats by name or JID
+            limit: Maximum number of chats to return (default 20)
+            page: Page number for pagination (default 0)
+            include_last_message: Whether to include the last message in each chat (default True)
+            sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        """
+        return _wa.list_chats(query=query, limit=limit, page=page,
+                              include_last_message=include_last_message, sort_by=sort_by)
+
+
+def _register_download(mcp) -> None:
+    _remove_tool(mcp, "download_media")
 
     from mcp.server.fastmcp import Image
 
