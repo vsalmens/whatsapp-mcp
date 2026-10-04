@@ -63,6 +63,8 @@ while read -r old new ref; do
       git --work-tree="$WORK" read-tree -u --reset "$old" \
         && git update-ref "refs/heads/$BRANCH" "$old" "$new" \
         && echo "↩ working tree and $BRANCH reverted to $(git rev-parse --short "$old")"
+      # uv sync may already have updated .venv for the failed push; match it to the old code again
+      ( cd "$WORK/whatsapp-mcp-server" && uv sync -q ) && echo "↩ Python environment re-synced"
     fi
     exit 1
   fi
