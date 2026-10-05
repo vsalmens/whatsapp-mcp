@@ -35,7 +35,8 @@ while read -r old new ref; do
   git --work-tree="$WORK" checkout -f "$BRANCH" || { echo "✗ checkout failed"; exit 1; }
 
   ok=1
-  ( cd "$WORK/whatsapp-bridge" && go build -o whatsapp-bridge.new . ) || ok=0
+  rev="$(git rev-parse --short "$new")"   # before cd: hooks run with a relative GIT_DIR
+  ( cd "$WORK/whatsapp-bridge" && go build -ldflags "-X main.buildCommit=$rev -X main.buildTime=$(date +%Y-%m-%dT%H:%M:%S%z)" -o whatsapp-bridge.new . ) || ok=0
   if (( ok )); then
     ( cd "$WORK/whatsapp-mcp-server" && uv sync -q && uv run python -m py_compile main.py whatsapp_extras.py ) || ok=0
   fi
