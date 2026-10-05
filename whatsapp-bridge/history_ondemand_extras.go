@@ -54,6 +54,19 @@ func startOnDemandHistoryLogging(client *whatsmeow.Client, store *MessageStore, 
 				if _, err := fixChatLastMessageTime(store, conv.GetID()); err != nil {
 					logger.Warnf("extras: failed to fix last message time of %s: %v", conv.GetID(), err)
 				}
+				// The bridge now holds these messages itself: drop imported copies of them
+				var ids []string
+				for _, m := range conv.GetMessages() {
+					if id := m.GetMessage().GetKey().GetID(); id != "" {
+						ids = append(ids, id)
+					}
+				}
+				unmarkImported(store, conv.GetID(), ids)
+				if n, err := removeImportDuplicates(store, conv.GetID()); err != nil {
+					logger.Warnf("extras: duplicate cleanup failed for %s: %v", conv.GetID(), err)
+				} else if n > 0 {
+					logger.Infof("extras: removed %d imported duplicates in %s", n, conv.GetID())
+				}
 			}
 			if v.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
 				handleOnDemandSync(v, logger)

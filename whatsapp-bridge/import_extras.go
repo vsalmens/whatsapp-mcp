@@ -9,8 +9,10 @@ package main
 // 1) history_limits: the oldest message the phone would serve per chat, recorded by
 //    /api/history (history_wait_extras.go) so later requests can answer without asking again.
 // 2) POST /api/import {"chat_jid": "...", "source": "file name", "messages": [...]} stores
-//    messages parsed from the phone's "Export chat" text (parsed by the MCP server).
-//    Imported messages get IDs starting with importIDPrefix and are listed in message_imports.
+//    messages parsed from the phone's "Export chat" text (parsed by the MCP server); these get
+//    IDs starting with importIDPrefix. With "keep_ids": true the messages carry their real
+//    WhatsApp IDs (e.g. from the phone's own database in a local backup), so messages already
+//    stored are skipped. Every inserted message is listed in message_imports.
 
 import (
 	"database/sql"
@@ -96,6 +98,7 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 	var req struct {
 		ChatJID  string `json:"chat_jid"`
 		ChatName string `json:"chat_name"`
+		KeepIDs  bool   `json:"keep_ids"`
 		Source   string `json:"source"`
 		Messages []struct {
 			ID        string    `json:"id"`
@@ -103,6 +106,7 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 			Sender    string    `json:"sender"`
 			IsFromMe  bool      `json:"is_from_me"`
 			Content   string    `json:"content"`
+			MediaType string    `json:"media_type"`
 		} `json:"messages"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
@@ -115,8 +119,10 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 		return
 	}
 	for _, m := range req.Messages {
-		if !strings.HasPrefix(m.ID, importIDPrefix) || m.Timestamp.IsZero() {
-			writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "every message needs an id starting with " + importIDPrefix + " and a timestamp"})
+		prefixed := strings.HasPrefix(m.ID, importIDPrefix)
+		if m.ID == "" || m.Timestamp.IsZero() || prefixed == req.KeepIDs {
+			writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "every message needs a timestamp and an id: " +
+				"real WhatsApp IDs with keep_ids, otherwise IDs starting with " + importIDPrefix})
 			return
 		}
 	}
@@ -151,8 +157,12 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 	inserted := 0
 	for _, m := range req.Messages {
 		var res sql.Result
-		res, err = tx.Exec(`INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?)`,
-			m.ID, req.ChatJID, m.Sender, m.Content, m.Timestamp, m.IsFromMe)
+		var mediaType any
+		if m.MediaType != "" {
+			mediaType = m.MediaType
+		}
+		res, err = tx.Exec(`INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			m.ID, req.ChatJID, m.Sender, m.Content, m.Timestamp, m.IsFromMe, mediaType)
 		if err != nil {
 			break
 		}
@@ -175,9 +185,97 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 	if _, err := fixChatLastMessageTime(store, req.ChatJID); err != nil {
 		logger.Warnf("extras: failed to fix last message time of %s: %v", req.ChatJID, err)
 	}
+	// Imported copies made redundant by real messages (also older chat-export rows)
+	removed, err := removeImportDuplicates(store, req.ChatJID)
+	if err != nil {
+		logger.Warnf("extras: duplicate cleanup failed for %s: %v", req.ChatJID, err)
+	}
 	logger.Infof("extras: imported %d of %d messages into %s", inserted, len(req.Messages), req.ChatJID)
 	writeExtrasJSON(w, http.StatusOK, map[string]any{
-		"success": true, "chat_jid": req.ChatJID, "received": len(req.Messages), "inserted": inserted,
+		"success": true, "chat_jid": req.ChatJID, "received": len(req.Messages), "inserted": inserted, "duplicates_removed": removed,
 		"already_present": len(req.Messages) - inserted,
 	})
+}
+
+// logicalChatJIDs returns the chat JID plus the same contact's other JID (phone number <-> LID)
+// from lid_names, so one logical 1:1 chat stored under both is treated as one.
+func logicalChatJIDs(store *MessageStore, chatJID string) []string {
+	jids := []string{chatJID}
+	user, server, ok := strings.Cut(chatJID, "@")
+	if !ok {
+		return jids
+	}
+	var alt string
+	switch server {
+	case types.DefaultUserServer:
+		_ = store.db.QueryRow(`SELECT lid || '@lid' FROM lid_names WHERE pn = ? AND lid != '' LIMIT 1`, user).Scan(&alt)
+	case types.HiddenUserServer:
+		_ = store.db.QueryRow(`SELECT pn || '@s.whatsapp.net' FROM lid_names WHERE lid = ? AND pn != ''`, user).Scan(&alt)
+	}
+	if alt != "" && alt != chatJID {
+		jids = append(jids, alt)
+	}
+	return jids
+}
+
+// unmarkImported records that the bridge itself has now stored these messages (upstream's
+// INSERT OR REPLACE overwrote any imported copy), so they no longer count as imported.
+func unmarkImported(store *MessageStore, chatJID string, ids []string) {
+	for i := 0; i < len(ids); i += 500 {
+		batch := ids[i:min(i+500, len(ids))]
+		args := []any{chatJID}
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		_, _ = store.db.Exec(`DELETE FROM message_imports WHERE chat_jid = ? AND message_id IN (?`+strings.Repeat(", ?", len(batch)-1)+`)`, args...)
+	}
+}
+
+// removeImportDuplicates deletes imported copies of messages the bridge has stored itself.
+// Only rows listed in message_imports (or with import- IDs) are ever deleted:
+//   - an imported row whose ID the bridge stored under the contact's other JID (PN <-> LID);
+//   - a chat-export row (import- ID, no real ID) when a real message in the same logical chat
+//     has the same minute, direction and text.
+func removeImportDuplicates(store *MessageStore, chatJID string) (int64, error) {
+	jids := logicalChatJIDs(store, chatJID)
+	in := "?" + strings.Repeat(", ?", len(jids)-1)
+	args := func(times int) []any {
+		var a []any
+		for range times {
+			for _, j := range jids {
+				a = append(a, j)
+			}
+		}
+		return a
+	}
+	var total int64
+	res, err := store.db.Exec(`
+		DELETE FROM messages WHERE chat_jid IN (`+in+`)
+		  AND EXISTS (SELECT 1 FROM message_imports i WHERE i.message_id = messages.id AND i.chat_jid = messages.chat_jid)
+		  AND EXISTS (SELECT 1 FROM messages r WHERE r.id = messages.id AND r.chat_jid IN (`+in+`) AND r.chat_jid != messages.chat_jid
+		              AND NOT EXISTS (SELECT 1 FROM message_imports i WHERE i.message_id = r.id AND i.chat_jid = r.chat_jid))`,
+		args(2)...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	total += n
+	res, err = store.db.Exec(`
+		DELETE FROM messages WHERE chat_jid IN (`+in+`) AND id LIKE '`+importIDPrefix+`%'
+		  AND EXISTS (SELECT 1 FROM messages r WHERE r.chat_jid IN (`+in+`) AND r.id NOT LIKE '`+importIDPrefix+`%'
+		              AND r.is_from_me = messages.is_from_me
+		              AND CAST(julianday(r.timestamp) * 1440 AS INTEGER) = CAST(julianday(messages.timestamp) * 1440 AS INTEGER)
+		              AND TRIM(COALESCE(r.content, '')) = TRIM(COALESCE(messages.content, '')))`,
+		args(2)...)
+	if err != nil {
+		return total, err
+	}
+	n, _ = res.RowsAffected()
+	total += n
+	if total > 0 {
+		_, err = store.db.Exec(`DELETE FROM message_imports WHERE chat_jid IN (`+in+`)
+			AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = message_imports.message_id AND m.chat_jid = message_imports.chat_jid)`,
+			args(1)...)
+	}
+	return total, err
 }
