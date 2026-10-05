@@ -7,6 +7,8 @@
     get_reactions(chat_jid, query=None, message_id=None, limit=5)
     export_chat_text(chat_jid, after=None, before=None, max_chars=60000, offset=0)
     refresh_contact_names()
+- Replaces list_messages with a version that merges a 1:1 chat stored under both the
+  contact's phone number and its LID (same contact, two JIDs after WhatsApp's LID migration).
 - Replaces download_media with a fixed version (bridge /api/download2) that returns
   images inline and, on request, document text, local transcriptions or raw files.
 - Disables structured-output validation (mcp >= 1.10) for upstream tools whose
@@ -18,6 +20,7 @@ Wiring in main.py, before `if __name__ == "__main__":`:
 """
 
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -125,6 +128,69 @@ def list_chats(query: Optional[str] = None, limit: int = 20, page: int = 0,
 _wa.list_chats = list_chats
 
 
+def chat_jids(chat_jid: str) -> list:
+    """The chat JID plus the same contact's alternate JID (LID <-> phone number), if known."""
+    jids = [chat_jid]
+    user, _, server = chat_jid.partition("@")
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            if server == "s.whatsapp.net":
+                row = conn.execute("SELECT lid FROM lid_names WHERE pn = ? AND lid != '' LIMIT 1", (user,)).fetchone()
+                if row:
+                    jids.append(f"{row[0]}@lid")
+            elif server == "lid":
+                row = conn.execute("SELECT pn FROM lid_names WHERE lid = ? AND pn != ''", (user,)).fetchone()
+                if row:
+                    jids.append(f"{row[0]}@s.whatsapp.net")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return jids
+
+
+def list_messages(after: Optional[str] = None, before: Optional[str] = None,
+                  sender_phone_number: Optional[str] = None, chat_jid: Optional[str] = None,
+                  query: Optional[str] = None, limit: int = 20, page: int = 0,
+                  include_context: bool = True, context_before: int = 1, context_after: int = 1):
+    """whatsapp.list_messages, but chat_jid also matches the contact's alternate (LID/PN) JID."""
+    where, params = [], []
+    if after:
+        where.append("messages.timestamp > ?"); params.append(datetime.fromisoformat(after))
+    if before:
+        where.append("messages.timestamp < ?"); params.append(datetime.fromisoformat(before))
+    if sender_phone_number:
+        where.append("messages.sender = ?"); params.append(sender_phone_number)
+    if chat_jid:
+        jids = chat_jids(chat_jid)
+        where.append(f"messages.chat_jid IN ({','.join('?' * len(jids))})"); params += jids
+    if query:
+        where.append("LOWER(messages.content) LIKE LOWER(?)"); params.append(f"%{query}%")
+    sql = ("SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, "
+           "chats.jid, messages.id, messages.media_type FROM messages JOIN chats ON messages.chat_jid = chats.jid"
+           + (" WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY messages.timestamp DESC LIMIT ? OFFSET ?")
+    params += [limit, page * limit]
+    conn = sqlite3.connect(_wa.MESSAGES_DB_PATH)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    result = [_wa.Message(timestamp=datetime.fromisoformat(r[0]), sender=r[1], chat_name=r[2], content=r[3],
+                          is_from_me=r[4], chat_jid=r[5], id=r[6], media_type=r[7]) for r in rows]
+    if include_context and result:
+        out = []
+        for msg in result:
+            ctx = _wa.get_message_context(msg.id, context_before, context_after)
+            out += ctx.before + [ctx.message] + ctx.after
+        return _wa.format_messages_list(out, show_chat_info=True)
+    return _wa.format_messages_list(result, show_chat_info=True)
+
+
+_wa.list_messages = list_messages
+
+
 def _post(path: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 40) -> Dict[str, Any]:
     try:
         resp = requests.post(f"{_wa.WHATSAPP_API_BASE_URL}/{path}", json=payload or {}, timeout=timeout)
@@ -158,28 +224,40 @@ def register(mcp) -> None:
 def _register_tools(mcp) -> None:
     _register_download(mcp)
     _register_list_chats(mcp)
+    _register_list_messages(mcp)
 
     @mcp.tool()
-    def request_older_messages(chat_jid: str, count: int = 50, from_newest: bool = False) -> Dict[str, Any]:
+    def request_older_messages(chat_jid: str, count: int = 50, from_newest: bool = False,
+                               wait: bool = True) -> Dict[str, Any]:
         """Request older history for one chat from the user's own phone.
 
-        Fetches `count` (max 100, recommended 50) messages older than the oldest
-        message currently stored for this chat. Messages arrive asynchronously:
-        wait a few seconds, then call list_messages again. Repeat to go further
-        back. The phone must be online. The request is sent only to the user's
-        own devices, never to other people.
+        Fetches `count` (max 100; the phone sends at most 50 per answer) messages older
+        than the oldest message stored for this chat, waits up to ~15 s for the phone's
+        answer and reports what happened:
+          status "received"           – messages arrived and are stored (call list_messages)
+          status "history_exhausted"  – the phone answered with zero messages for every
+                                        anchor tried: it has nothing older for this chat
+          status "no_response"        – the phone did not answer (offline or ignored)
+          status "rejected"           – the phone answered with an error response_code
+        Also returned: phone_responded, response_code, received_count, history_exhausted,
+        anchor_used and the individual attempts. If the phone answers with nothing, other
+        anchors (and, for 1:1 chats, the contact's LID/phone-number JID) are tried
+        automatically. Repeat the call to go further back.
+        The request is sent only to the user's own devices, never to other people.
 
-        If the chat has no stored messages at all, the request is sent without an
-        anchor (status "sent_without_anchor", experimental): the phone may ignore it,
-        so verify with list_messages instead of assuming success.
+        If the chat has no stored messages at all, the request is sent without an anchor
+        (experimental; "anchorless": true).
 
         Args:
             chat_jid: JID of the chat (e.g. 123456789012345678@g.us or 15551234567@s.whatsapp.net)
             count: number of messages to request (default 50)
             from_newest: if True, re-fetch the most recent `count` messages instead of
                 older ones (useful for picking up reactions on recent messages)
+            wait: if False, only send the request (status "sent") and return immediately;
+                messages arrive asynchronously
         """
-        return _post("history", {"chat_jid": chat_jid, "count": count, "from_newest": from_newest})
+        return _post("history", {"chat_jid": chat_jid, "count": count, "from_newest": from_newest,
+                                 "wait": wait}, timeout=90)
 
     @mcp.tool()
     def get_reactions(chat_jid: str, query: Optional[str] = None, message_id: Optional[str] = None,
@@ -274,8 +352,10 @@ def _register_tools(mcp) -> None:
         """
         try:
             conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
-            q = "SELECT id, timestamp, sender, content, media_type, is_from_me FROM messages WHERE chat_jid=?"
-            args: list = [chat_jid]
+            jids = chat_jids(chat_jid)
+            in_jids = f"({','.join('?' * len(jids))})"
+            q = f"SELECT id, timestamp, sender, content, media_type, is_from_me FROM messages WHERE chat_jid IN {in_jids}"
+            args: list = list(jids)
             if after:
                 q += " AND timestamp >= ?"; args.append(after)
             if before:
@@ -286,8 +366,8 @@ def _register_tools(mcp) -> None:
             if include_reactions:
                 try:
                     for mid, emoji, cnt in conn.execute(
-                            "SELECT message_id, emoji, COUNT(*) FROM reactions WHERE chat_jid=? GROUP BY message_id, emoji",
-                            (chat_jid,)):
+                            f"SELECT message_id, emoji, COUNT(*) FROM reactions WHERE chat_jid IN {in_jids} GROUP BY message_id, emoji",
+                            jids):
                         reacts[mid] = (reacts.get(mid, "") + f" {emoji}{cnt}").strip()
                 except sqlite3.Error:
                     pass
@@ -374,6 +454,56 @@ def _register_list_chats(mcp) -> None:
                               include_last_message=include_last_message, sort_by=sort_by)
 
 
+def _register_list_messages(mcp) -> None:
+    # main.py imported upstream list_messages by name, so replace the tool, not just the function
+    _remove_tool(mcp, "list_messages")
+
+    @mcp.tool()
+    def list_messages(after: Optional[str] = None, before: Optional[str] = None,
+                      sender_phone_number: Optional[str] = None, chat_jid: Optional[str] = None,
+                      query: Optional[str] = None, limit: int = 20, page: int = 0,
+                      include_context: bool = True, context_before: int = 1, context_after: int = 1):
+        """Get WhatsApp messages matching specified criteria with optional context.
+
+        A 1:1 chat stored under both the contact's phone number and LID is listed as one chat.
+
+        Args:
+            after: Optional ISO-8601 formatted string to only return messages after this date
+            before: Optional ISO-8601 formatted string to only return messages before this date
+            sender_phone_number: Optional phone number to filter messages by sender
+            chat_jid: Optional chat JID to filter messages by chat
+            query: Optional search term to filter messages by content
+            limit: Maximum number of messages to return (default 20)
+            page: Page number for pagination (default 0)
+            include_context: Whether to include messages before and after matches (default True)
+            context_before: Number of messages to include before each match (default 1)
+            context_after: Number of messages to include after each match (default 1)
+        """
+        return _wa.list_messages(after=after, before=before, sender_phone_number=sender_phone_number,
+                                 chat_jid=chat_jid, query=query, limit=limit, page=page,
+                                 include_context=include_context, context_before=context_before,
+                                 context_after=context_after)
+
+
+def _media_details(path: str, mtype: str) -> str:
+    """MIME type and, for audio/video, duration (via ffprobe when installed)."""
+    import mimetypes
+    parts = [mimetypes.guess_type(path)[0] or "application/octet-stream"]
+    if mtype in ("audio", "video") and shutil.which("ffprobe"):
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                  "-of", "default=nw=1:nk=1", path],
+                                 capture_output=True, text=True, timeout=20).stdout.strip()
+            parts.append(f"{float(out):.1f} s")
+        except (ValueError, subprocess.SubprocessError, OSError):
+            pass
+    return ", ".join(parts)
+
+
+class TranscriptionUnavailable(Exception):
+    pass
+
+
 def _register_download(mcp) -> None:
     _remove_tool(mcp, "download_media")
 
@@ -403,12 +533,25 @@ def _register_download(mcp) -> None:
             return res
         path = res.get("path", "")
         mtype = res.get("media_type", "")
+        # Never hand back a file that belongs to another message
+        if res.get("message_id") != message_id or not os.path.basename(path).startswith(re.sub(r"[^A-Za-z0-9_-]", "_", message_id)):
+            return {"success": False, "message_id": message_id,
+                    "message": f"bridge returned a file that does not match message {message_id} ({os.path.basename(path)})"}
+        if not os.path.exists(path):
+            return {"success": False, "message_id": message_id, "message": f"downloaded file is missing: {path}"}
         ext = os.path.splitext(path)[1].lower()
-        meta = (f"{res.get('filename')} ({mtype}, {res.get('bytes', '?')} B)"
+        orig = res.get("original_filename") or ""
+        meta = (f"Message {message_id}: {res.get('filename')} ({mtype}, {_media_details(path, mtype)}, "
+                f"{res.get('bytes') or os.path.getsize(path)} B)"
+                f"{f' — original name {orig}' if mtype == 'document' and orig else ''}"
                 f"{' — restored from phone' if res.get('retried') else ''}\nFile (on the bridge host): {path}")
         try:
             if content == "transcribe":
-                return meta + "\n\n--- transcript ---\n" + _transcribe(path)
+                try:
+                    return meta + "\n\n--- transcript ---\n" + _transcribe(path)
+                except TranscriptionUnavailable as e:
+                    return {"success": False, "message_id": message_id, "path": path,
+                            "message": f"transcription unavailable: {e}"}
             if content == "text":
                 return meta + "\n\n--- text ---\n" + _extract_text(path)
             if content == "file":
@@ -467,9 +610,9 @@ def _transcribe(path: str) -> str:
     model = os.environ.get("WHISPER_MODEL", os.path.expanduser("~/models/ggml-large-v3-turbo.bin"))
     whisper = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
     if not whisper or not shutil.which("ffmpeg"):
-        return "(transcription requires: brew install whisper-cpp ffmpeg)"
+        raise TranscriptionUnavailable("whisper-cli and ffmpeg are required on the bridge host (brew install whisper-cpp ffmpeg)")
     if not os.path.exists(model):
-        return f"(whisper model not found: {model} – download a model or set WHISPER_MODEL)"
+        raise TranscriptionUnavailable(f"whisper model not found: {model} (download a model or set WHISPER_MODEL)")
     with tempfile.TemporaryDirectory() as td:
         wav = os.path.join(td, "in.wav")
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-ar", "16000", "-ac", "1", wav],

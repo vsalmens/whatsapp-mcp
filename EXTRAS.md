@@ -6,8 +6,8 @@ separate files so that upstream changes and fixes from other forks merge with fe
 | Area | What changes |
 |---|---|
 | **Names** | `@lid` pseudonyms resolved to contact names (`lid_names` table); your own chat shows as *Me (note to self)*; sender lookup no longer mis-matches legacy group JIDs |
-| **History** | On-demand history from your phone (`/api/history`, tool `request_older_messages`), anchored on the oldest or newest stored message; `scripts/backfill-history.sh` for bulk runs |
-| **Media** | Fixed downloads (the signed query string is kept — upstream strips it and gets 403), automatic *media retry* via the phone for expired media; images returned inline, document text / local transcription / raw file on request |
+| **History** | On-demand history from your phone (`/api/history`, tool `request_older_messages`), anchored on the oldest or newest stored message; reports what the phone answered (received / exhausted / no response) and retries other anchors; `scripts/backfill-history.sh` for bulk runs |
+| **Media** | Files named by message ID (upstream names collide); fixed downloads (the signed query string is kept — upstream strips it and gets 403), automatic *media retry* via the phone for expired media; images returned inline, document text / local transcription / raw file on request |
 | **Reactions** | Stored live and from history syncs, including the newer *message add-on* format; current state (`reactions`) plus an append-only change log (`reaction_events`) |
 | **Edits** | Edited messages are versioned (`message_edits`: version 0 = original, 1.. = edits with edit timestamps); reactions on edit wrappers are attached to the original message |
 | **Bulk reading** | Tool `export_chat_text` exports a chat as compact chronological text in chunks — for summaries and overall analyses |
@@ -33,7 +33,9 @@ on `127.0.0.1`.
 
 | File | Purpose |
 |---|---|
-| `whatsapp-bridge/lid_history.go` | `startExtras()` entry point, LID names, `/api/history`, `/api/refresh_names` |
+| `whatsapp-bridge/lid_history.go` | `startExtras()` entry point, LID names, `/api/refresh_names` |
+| `whatsapp-bridge/history_wait_extras.go` | `/api/history`: waits for the phone's answer, anchor and LID/PN fallbacks; chat last-message-time repair |
+| `whatsapp-bridge/history_ondemand_extras.go` | Logs on-demand answers (end-of-history flags) and hands them to waiting requests |
 | `whatsapp-bridge/media_extras.go` | `/api/download2` with media retry |
 | `whatsapp-bridge/reactions_extras.go` | Reactions, reaction change log, edit versioning, debug helpers |
 | `whatsapp-bridge/host_guard.go` | Device-key owner check (`store/.host`) |

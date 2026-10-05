@@ -17,7 +17,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-func startOnDemandHistoryLogging(client *whatsmeow.Client, logger waLog.Logger) {
+func startOnDemandHistoryLogging(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
 	client.AddEventHandler(func(evt any) {
 		switch v := evt.(type) {
 		case *events.Message:
@@ -32,6 +32,9 @@ func startOnDemandHistoryLogging(client *whatsmeow.Client, logger waLog.Logger) 
 					codes = append(codes, r.GetResponseCode().String())
 				}
 			}
+			if len(codes) > 0 {
+				deliverPeerCode(resp.GetStanzaID(), codes[0])
+			}
 			logger.Infof("extras: peer data response type=%s request_id=%s results=%d history_codes=[%s]",
 				resp.GetPeerDataOperationRequestType(), resp.GetStanzaID(),
 				len(resp.GetPeerDataOperationResult()), strings.Join(codes, ","))
@@ -42,11 +45,14 @@ func startOnDemandHistoryLogging(client *whatsmeow.Client, logger waLog.Logger) 
 			}
 			convs := v.Data.GetConversations()
 			logger.Infof("extras: history sync type=%s conversations=%d", v.Data.GetSyncType(), len(convs))
-			if v.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
-				return
-			}
+			// Upstream has already stored the batch (its handler is registered first)
 			for _, conv := range convs {
-				logger.Infof("extras: on-demand history %s: %d messages", conv.GetID(), len(conv.GetMessages()))
+				if _, err := fixChatLastMessageTime(store, conv.GetID()); err != nil {
+					logger.Warnf("extras: failed to fix last message time of %s: %v", conv.GetID(), err)
+				}
+			}
+			if v.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
+				handleOnDemandSync(v, logger)
 			}
 		}
 	})

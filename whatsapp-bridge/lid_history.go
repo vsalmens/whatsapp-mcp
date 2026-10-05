@@ -7,11 +7,9 @@ package main
 //    messages.db. Also fixes chat names of 1:1 chats that only show a raw ID.
 //    Runs 20 s after start-up and every 10 minutes after that.
 //
-// 2) On-demand history: POST /api/history {"chat_jid": "...", "count": 50}
-//    asks the user's own phone for `count` messages older than the oldest
-//    stored message (or the newest, with "from_newest": true). The answer
-//    arrives asynchronously as a regular history sync event.
-//    The request is a peer message sent ONLY to the user's own devices.
+// 2) On-demand history: POST /api/history (history_wait_extras.go) asks the
+//    user's own phone for older messages of one chat. The request is a peer
+//    message sent ONLY to the user's own devices.
 //
 // Wiring: add this line after the startRESTServer(...) call in main.go:
 //     startExtras(client, messageStore, logger)
@@ -20,7 +18,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -46,7 +43,14 @@ func startExtras(client *whatsmeow.Client, store *MessageStore, logger waLog.Log
 		logger.Errorf("extras: failed to create lid_names table: %v", err)
 	}
 
-	startOnDemandHistoryLogging(client, logger)
+	startOnDemandHistoryLogging(client, store, logger) // history_ondemand_extras.go
+
+	// One-time repair of chats whose last message time was moved back by history batches
+	if n, err := fixChatLastMessageTime(store, ""); err != nil {
+		logger.Warnf("extras: failed to fix chat last message times: %v", err)
+	} else if n > 0 {
+		logger.Infof("extras: fixed last message time of %d chats", n)
+	}
 
 	http.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		handleHistoryRequest(client, store, logger, w, r)
@@ -246,116 +250,6 @@ func renamePNChats(ctx context.Context, client *whatsmeow.Client, store *Message
 		}
 	}
 	return renamed
-}
-
-func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeExtrasJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "POST only"})
-		return
-	}
-
-	var req struct {
-		ChatJID         string `json:"chat_jid"`
-		Count           int    `json:"count"`
-		FromNewest      bool   `json:"from_newest"`       // anchor on the newest message (re-fetch recent messages, e.g. for reactions)
-		AnchorMessageID string `json:"anchor_message_id"` // or on a specific message
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
-		writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "missing chat_jid or invalid request"})
-		return
-	}
-	if req.Count <= 0 || req.Count > 100 {
-		req.Count = 50 // whatsmeow recommends 50 per request
-	}
-
-	if !client.IsConnected() || client.Store.ID == nil {
-		writeExtrasJSON(w, http.StatusServiceUnavailable, map[string]any{"success": false, "message": "bridge is not connected to WhatsApp"})
-		return
-	}
-
-	chat, err := types.ParseJID(req.ChatJID)
-	if err != nil {
-		writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "invalid chat_jid: " + err.Error()})
-		return
-	}
-
-	// Anchor message for the request
-	var (
-		oldestID string
-		oldestTS time.Time
-		fromMe   bool
-	)
-	switch {
-	case req.AnchorMessageID != "":
-		err = store.db.QueryRow(`
-			SELECT id, timestamp, is_from_me FROM messages
-			WHERE chat_jid = ? AND id = ?`, req.ChatJID, req.AnchorMessageID).Scan(&oldestID, &oldestTS, &fromMe)
-	case req.FromNewest:
-		err = store.db.QueryRow(`
-			SELECT id, timestamp, is_from_me FROM messages
-			WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1`, req.ChatJID).Scan(&oldestID, &oldestTS, &fromMe)
-	default:
-		err = store.db.QueryRow(`
-			SELECT id, timestamp, is_from_me FROM messages
-			WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1`, req.ChatJID).Scan(&oldestID, &oldestTS, &fromMe)
-	}
-	// Experimental: with no stored messages there is no anchor. Send the request without one
-	// (empty ID, current time) and let the phone decide; the outcome is only visible in the log.
-	anchorless := false
-	if err == sql.ErrNoRows && req.AnchorMessageID == "" {
-		anchorless, err = true, nil
-		oldestID, oldestTS, fromMe = "", time.Now(), false
-	}
-	if err == sql.ErrNoRows {
-		writeExtrasJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "anchor message not found in this chat"})
-		return
-	} else if err != nil {
-		writeExtrasJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "database error: " + err.Error()})
-		return
-	}
-
-	info := &types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:     chat,
-			IsFromMe: fromMe,
-			IsGroup:  chat.Server == types.GroupServer,
-		},
-		ID:        types.MessageID(oldestID),
-		Timestamp: oldestTS,
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	sent, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(info, req.Count))
-	if err != nil {
-		logger.Warnf("extras: history request failed (%s): %v", req.ChatJID, err)
-		writeExtrasJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "failed to send the request to the phone: " + err.Error()})
-		return
-	}
-
-	if anchorless {
-		logger.Infof("extras: requested %d messages in %s WITHOUT anchor (experimental: is_group=%v, timestamp=%s, request_id=%s)",
-			req.Count, req.ChatJID, info.IsGroup, oldestTS.Format(time.RFC3339), sent.ID)
-		writeExtrasJSON(w, http.StatusOK, map[string]any{
-			"success":      true,
-			"status":       "sent_without_anchor",
-			"experimental": true,
-			"message": "No stored messages in this chat, so the request was sent without an anchor message (experimental). " +
-				"The phone may ignore or reject it: check list_messages after 10-30 seconds; the bridge log shows the phone's response code.",
-			"requested":  req.Count,
-			"request_id": sent.ID,
-		})
-		return
-	}
-
-	logger.Infof("extras: requested %d messages before %s in %s (request_id=%s)", req.Count, oldestTS.Format(time.RFC3339), req.ChatJID, sent.ID)
-	writeExtrasJSON(w, http.StatusOK, map[string]any{
-		"success":      true,
-		"status":       "sent",
-		"message":      "Request sent to the phone. Messages arrive asynchronously (usually within seconds; the phone must be online).",
-		"requested":    req.Count,
-		"oldest_known": oldestTS.Format(time.RFC3339), // timestamp of the anchor message
-	})
 }
 
 func writeExtrasJSON(w http.ResponseWriter, status int, body map[string]any) {

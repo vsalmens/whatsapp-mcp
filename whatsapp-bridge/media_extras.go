@@ -11,7 +11,7 @@ package main
 //   1) builds the direct path including the signed query and downloads the media
 //   2) if the media has expired on WhatsApp's servers (403/404/410), asks the phone to
 //      re-upload it (media retry), waits for the new path and tries again
-//   3) stores the file under store/<chat>/<filename> and returns its path
+//   3) stores the file under store/<chat>/<message ID><ext> and returns its path
 //
 // Started from startExtras() (lid_history.go); no extra wiring needed.
 // API signatures checked against whatsmeow 8b41cfe (2026-09-29).
@@ -124,7 +124,7 @@ func handleDownload2(client *whatsmeow.Client, store *MessageStore, logger waLog
 		writeExtrasJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "message not found in the database"})
 		return
 	} else if err != nil {
-		writeExtrasJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "tietokantavirhe: " + err.Error()})
+		writeExtrasJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "database error: " + err.Error()})
 		return
 	}
 	if mediaType.String == "" {
@@ -132,17 +132,18 @@ func handleDownload2(client *whatsmeow.Client, store *MessageStore, logger waLog
 		return
 	}
 
-	name := filename.String
-	if name == "" {
-		name = req.MessageID
-	}
-	name = filepath.Base(name)
+	// Upstream names media files by the time the message was stored (e.g. audio_20261002_080052.ogg),
+	// so messages stored in the same second of a history sync share one name and the cache check
+	// below returned another message's file. Name the file by message ID instead; old
+	// timestamp-named files are simply no longer looked up.
+	name := mediaFileName(req.MessageID, mediaType.String, filename.String)
 	chatDir := filepath.Join("store", strings.ReplaceAll(req.ChatJID, ":", "_"))
 	localPath := filepath.Join(chatDir, name)
 	absPath, _ := filepath.Abs(localPath)
 
 	if _, err := os.Stat(localPath); err == nil {
-		writeExtrasJSON(w, http.StatusOK, map[string]any{"success": true, "path": absPath, "media_type": mediaType.String, "filename": name, "cached": true})
+		writeExtrasJSON(w, http.StatusOK, map[string]any{"success": true, "path": absPath, "media_type": mediaType.String, "filename": name,
+			"message_id": req.MessageID, "original_filename": filename.String, "cached": true})
 		return
 	}
 
@@ -241,7 +242,7 @@ func handleDownload2(client *whatsmeow.Client, store *MessageStore, logger waLog
 	}
 	if err != nil {
 		logger.Warnf("extras: media download failed (%s): %v", req.MessageID, err)
-		writeExtrasJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "download failed: " + err.Error(), "retried": retried})
+		writeExtrasJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": fmt.Sprintf("download of message %s failed: %v", req.MessageID, err), "message_id": req.MessageID, "retried": retried})
 		return
 	}
 
@@ -255,6 +256,25 @@ func handleDownload2(client *whatsmeow.Client, store *MessageStore, logger waLog
 	}
 	writeExtrasJSON(w, http.StatusOK, map[string]any{
 		"success": true, "path": absPath, "media_type": mediaType.String, "filename": name,
-		"bytes": len(data), "retried": retried,
+		"message_id": req.MessageID, "original_filename": filename.String, "bytes": len(data), "retried": retried,
 	})
+}
+
+// mediaFileName returns "<message ID><ext>": unique per chat directory and stable across downloads.
+// The extension comes from the stored file name (documents keep theirs) or the media type.
+func mediaFileName(messageID, mediaType, storedName string) string {
+	ext := strings.ToLower(filepath.Ext(filepath.Base(storedName)))
+	if len(ext) < 2 || len(ext) > 10 || strings.ContainsAny(ext, " /\\") {
+		ext = ""
+	}
+	if ext == "" {
+		ext = map[string]string{"image": ".jpg", "video": ".mp4", "audio": ".ogg"}[mediaType]
+	}
+	safe := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, messageID)
+	return safe + ext
 }
