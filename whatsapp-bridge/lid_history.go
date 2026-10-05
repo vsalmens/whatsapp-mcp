@@ -84,6 +84,7 @@ func startExtras(client *whatsmeow.Client, store *MessageStore, logger waLog.Log
 
 	startMediaExtras(client, store, logger)    // media_extras.go
 	startReactionExtras(client, store, logger) // reactions_extras.go
+	startImportExtras(store, logger)           // import_extras.go
 }
 
 // contactDisplayName returns the best available name from the contact store.

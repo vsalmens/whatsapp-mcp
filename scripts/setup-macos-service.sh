@@ -14,6 +14,10 @@
 #   MCP_PORT      MCP HTTP port                     (default: 8001)
 #   BIND_IP       IP the MCP server listens on      (default: this machine's Tailscale IPv4)
 #   BIND_NAME     extra allowed Host name           (default: this machine's Tailscale DNS name)
+#   EXPORT_DIR    folder for chat exports from the phone (import_chat_export); unset = disabled.
+#                 A synced cloud folder works; on macOS the server's Python then needs Full Disk Access.
+#   EXPORT_DIR_LABEL  how to name that folder to the user (default: the path)
+#   MY_NAME       your name(s) as they appear in exports, comma-separated (optional)
 #
 # What it does:
 #   1) makes sure the bridge REST API listens on 127.0.0.1 only
@@ -84,6 +88,13 @@ cat > "$LA/$BRIDGE_LABEL.plist" <<PLIST
 </dict></plist>
 PLIST
 
+xml_escape() { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&gt;}"; }
+EXTRA_ENV=""
+for pair in "WHATSAPP_EXPORT_DIR=${EXPORT_DIR:-}" "WHATSAPP_EXPORT_DIR_LABEL=${EXPORT_DIR_LABEL:-}" "WHATSAPP_MY_NAME=${MY_NAME:-}"; do
+  [[ -n "${pair#*=}" ]] && EXTRA_ENV+="    <key>${pair%%=*}</key><string>$(xml_escape "${pair#*=}")</string>"$'\n'
+done
+[[ -n "${EXPORT_DIR:-}" && ! -d "$EXPORT_DIR" ]] && echo "! EXPORT_DIR does not exist (yet): $EXPORT_DIR"
+
 cat > "$LA/$MCP_LABEL.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -98,7 +109,7 @@ cat > "$LA/$MCP_LABEL.plist" <<PLIST
     <key>MCP_PORT</key><string>$MCP_PORT</string>
     <key>MCP_ALLOWED_HOSTS</key><string>$ALLOWED</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
+${EXTRA_ENV}  </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>$LOGS/whatsapp-mcp.log</string>

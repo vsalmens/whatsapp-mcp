@@ -206,7 +206,7 @@ func anchorCandidates(store *MessageStore, chats []string, fromNewest bool, anch
 	if len(chats) > 1 {
 		in, args = "?, ?", []any{chats[0], chats[1]}
 	}
-	base := `SELECT id, chat_jid, timestamp, is_from_me FROM messages WHERE chat_jid IN (` + in + `)`
+	base := `SELECT id, chat_jid, timestamp, is_from_me FROM messages WHERE chat_jid IN (` + in + `) AND id NOT LIKE '` + importIDPrefix + `%'`
 	switch {
 	case anchorID != "":
 		return queryAnchors(store, base+` AND id = ? LIMIT 1`, append(args, anchorID)...)
@@ -277,6 +277,7 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		FromNewest      bool   `json:"from_newest"`
 		AnchorMessageID string `json:"anchor_message_id"`
 		Wait            *bool  `json:"wait"`
+		Force           bool   `json:"force"` // ask the phone even if its limit for this chat is known
 		WaitSeconds     int    `json:"wait_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
@@ -329,6 +330,21 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		// Experimental: no stored messages, so send without an anchor and let the phone decide
 		anchorless = true
 		anchors = []historyAnchor{{TS: time.Now()}}
+	}
+
+	// The phone already said it will not go further back for this chat: answer without asking again
+	if !req.FromNewest && req.AnchorMessageID == "" && !req.Force && !anchorless {
+		if l, ok := knownHistoryLimit(store, stored, anchors[0].TS); ok {
+			writeExtrasJSON(w, http.StatusOK, map[string]any{
+				"success": true, "status": "phone_limit_known", "phone_responded": false,
+				"response_code": l.ResponseCode, "received_count": 0, "new_messages": 0, "history_exhausted": false,
+				"oldest_available": l.OldestAvailable.Format(time.RFC3339), "limit_checked_at": l.CheckedAt.Format(time.RFC3339),
+				"message": fmt.Sprintf("Checked %s: the phone does not give this device messages older than %s for this chat "+
+					"(%s); they are only on the phone. Use force=true to ask again.",
+					l.CheckedAt.Format("2006-01-02 15:04"), l.OldestAvailable.Format("2006-01-02 15:04"), l.ResponseCode),
+			})
+			return
+		}
 	}
 
 	if !wait {
@@ -497,6 +513,12 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		}
 		msg += "."
 	}
+	limitReached := status == "phone_sent_nothing" || status == "no_access" || status == "history_exhausted"
+	if limitReached && !req.FromNewest && req.AnchorMessageID == "" && !anchorless {
+		if err := recordHistoryLimit(store, req.ChatJID, anchors[0].TS, responseCode); err != nil {
+			logger.Warnf("extras: failed to record history limit of %s: %v", req.ChatJID, err)
+		}
+	}
 	if received > newMsgs {
 		msg += fmt.Sprintf(" %d received message(s) were already stored.", received-newMsgs)
 	}
@@ -515,6 +537,7 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		"received_count":    received,
 		"new_messages":      newMsgs,
 		"history_exhausted": exhausted,
+		"oldest_available":  map[bool]string{true: anchors[0].TS.Format(time.RFC3339)}[limitReached && !anchorless],
 		"anchorless":        anchorless,
 		"anchor_used": map[string]any{
 			"id": best.AnchorID, "timestamp": best.AnchorTime, "from_me": best.AnchorFromMe, "sent_as_chat": best.SentAsChat,

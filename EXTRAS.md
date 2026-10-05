@@ -7,6 +7,7 @@ separate files so that upstream changes and fixes from other forks merge with fe
 |---|---|
 | **Names** | `@lid` pseudonyms resolved to contact names (`lid_names` table); your own chat shows as *Me (note to self)*; sender lookup no longer mis-matches legacy group JIDs |
 | **History** | On-demand history from your phone (`/api/history`, tool `request_older_messages`), anchored on the oldest or newest stored message; reports what the phone answered (received / exhausted / no response) and retries other anchors; `scripts/backfill-history.sh` for bulk runs |
+| **Chat exports** | WhatsApp gives linked devices only part of a chat's history on demand (the phone answers "more remain on the phone"); that limit is recorded per chat and explained to the user. Older history can be imported from the phone's *Export chat* file via a configured folder (tools `list_chat_exports`, `import_chat_export`) |
 | **Media** | Files named by message ID (upstream names collide); fixed downloads (the signed query string is kept — upstream strips it and gets 403), automatic *media retry* via the phone for expired media; images returned inline, document text / local transcription / raw file on request |
 | **Reactions** | Stored live and from history syncs, including the newer *message add-on* format; current state (`reactions`) plus an append-only change log (`reaction_events`) |
 | **Edits** | Edited messages are versioned (`message_edits`: version 0 = original, 1.. = edits with edit timestamps); reactions on edit wrappers are attached to the original message |
@@ -35,6 +36,8 @@ on `127.0.0.1`.
 |---|---|
 | `whatsapp-bridge/lid_history.go` | `startExtras()` entry point, LID names, `/api/refresh_names` |
 | `whatsapp-bridge/history_wait_extras.go` | `/api/history`: waits for the phone's answer, anchor and LID/PN fallbacks; chat last-message-time repair |
+| `whatsapp-bridge/import_extras.go` | `/api/import` for chat exports; `history_limits` and `message_imports` tables |
+| `whatsapp-mcp-server/chat_import.py` | Parser for *Export chat* text files (iPhone/Android, common locales) |
 | `whatsapp-bridge/history_ondemand_extras.go` | Logs on-demand answers (end-of-history flags) and hands them to waiting requests |
 | `whatsapp-bridge/media_extras.go` | `/api/download2` with media retry |
 | `whatsapp-bridge/reactions_extras.go` | Reactions, reaction change log, edit versioning, debug helpers |
@@ -123,3 +126,20 @@ Protocol changes land in [whatsmeow](https://github.com/tulir/whatsmeow), not in
 
 The extras are released under the MIT License (see `LICENSE-EXTRAS`). The upstream code keeps
 its own MIT license (`LICENSE`). whatsmeow is used as a library under MPL-2.0.
+
+### Importing chat exports
+
+WhatsApp keeps part of every chat's history on the phone only: `request_older_messages` then
+returns `phone_sent_nothing` (and `phone_limit_known` for a week afterwards, `force=True` asks
+again) with a `user_message` explaining it. To add that history:
+
+1. Configure an export folder for the MCP server, e.g. a Google Drive folder synced to the
+   bridge host: `EXPORT_DIR=... EXPORT_DIR_LABEL="Google Drive › whatsapp-export" MY_NAME="Your Name"`
+   when running `scripts/setup-macos-service.sh` (sets `WHATSAPP_EXPORT_DIR`,
+   `WHATSAPP_EXPORT_DIR_LABEL`, `WHATSAPP_MY_NAME`). On macOS, cloud folders are privacy-protected:
+   give the Python that runs the MCP server Full Disk Access.
+2. On the phone: chat → Export chat → Without media → save to that folder (.txt or .zip).
+3. Ask Claude to import it: `list_chat_exports`, then `import_chat_export` (dry run first).
+
+Only messages older than the oldest stored WhatsApp message are imported, with IDs
+`import-<hash>`, so repeating an import adds nothing. They have no reactions or media.

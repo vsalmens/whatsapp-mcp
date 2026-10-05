@@ -11,6 +11,9 @@
   contact's phone number and its LID (same contact, two JIDs after WhatsApp's LID migration).
 - Replaces download_media with a fixed version (bridge /api/download2) that returns
   images inline and, on request, document text, local transcriptions or raw files.
+- Adds chat export import (chat_import.py): list_chat_exports(), import_chat_export(...) read
+  the phone's "Export chat" files from WHATSAPP_EXPORT_DIR and store them via bridge /api/import.
+  Where WhatsApp keeps older history on the phone only (history_limits), tools say so.
 - Disables structured-output validation (mcp >= 1.10) for upstream tools whose
   return annotations do not match what they return.
 
@@ -26,11 +29,19 @@ import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 import whatsapp as _wa
+import chat_import
+
+# Folder the user saves "Export chat" files to (e.g. a synced Google Drive folder), and how to
+# describe it to the user ("Google Drive › whatsapp-export"); unset = import disabled.
+EXPORT_DIR = os.environ.get("WHATSAPP_EXPORT_DIR", "")
+EXPORT_DIR_LABEL = os.environ.get("WHATSAPP_EXPORT_DIR_LABEL", "") or EXPORT_DIR
+# Names the user appears under in exports (comma-separated), e.g. "Ville Salmensuu,Ville"
+MY_EXPORT_NAMES = [n.strip() for n in os.environ.get("WHATSAPP_MY_NAME", "").split(",") if n.strip()]
 
 # Must match SelfChatName in whatsapp-bridge/lid_history.go
 SELF_CHAT_NAME = "Me (note to self)"
@@ -184,8 +195,62 @@ def list_messages(after: Optional[str] = None, before: Optional[str] = None,
         for msg in result:
             ctx = _wa.get_message_context(msg.id, context_before, context_after)
             out += ctx.before + [ctx.message] + ctx.after
-        return _wa.format_messages_list(out, show_chat_info=True)
-    return _wa.format_messages_list(result, show_chat_info=True)
+        text = _wa.format_messages_list(out, show_chat_info=True)
+    else:
+        text = _wa.format_messages_list(result, show_chat_info=True)
+    if chat_jid and len(result) < limit:
+        note = history_limit_note(chat_jid, after)
+        if note:
+            text += "\n" + note
+    return text
+
+
+def history_limit(chat_jid: str) -> Optional[Dict[str, Any]]:
+    """The phone's recorded on-demand limit for this chat (bridge table history_limits), if any,
+    and whether imported messages already reach further back."""
+    jids = chat_jids(chat_jid)
+    marks = ",".join("?" * len(jids))
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            row = conn.execute(f"SELECT oldest_available, response_code, checked_at FROM history_limits "
+                               f"WHERE chat_jid IN ({marks}) ORDER BY checked_at DESC LIMIT 1", jids).fetchone()
+            if not row:
+                return None
+            boundary = datetime.fromisoformat(str(row[0]))
+            older_imports = conn.execute(
+                f"SELECT count(*), min(timestamp) FROM messages WHERE chat_jid IN ({marks}) AND id LIKE 'import-%'",
+                jids).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return None
+    return {"oldest_available": boundary, "response_code": row[1], "checked_at": row[2],
+            "imported_count": older_imports[0], "imported_from": older_imports[1]}
+
+
+def export_instructions() -> str:
+    where = f" and save it to {EXPORT_DIR_LABEL}" if EXPORT_DIR else ""
+    then = (" Then ask me to import it (import_chat_export)." if EXPORT_DIR
+            else " (Importing needs WHATSAPP_EXPORT_DIR to be configured on the server.)")
+    return ("To include them, open the chat on the phone, choose Export chat → Without media"
+            f"{where}.{then}")
+
+
+def history_limit_note(chat_jid: str, after: Optional[str] = None) -> str:
+    lim = history_limit(chat_jid)
+    if not lim or lim["imported_count"]:
+        return ""
+    boundary = lim["oldest_available"]
+    if after:
+        try:
+            a = datetime.fromisoformat(after)
+            if (a.tzinfo and a >= boundary) or (not a.tzinfo and a >= boundary.replace(tzinfo=None)):
+                return ""
+        except ValueError:
+            pass
+    return (f"Note: messages before {boundary:%Y-%m-%d} are not available for this chat: WhatsApp lets linked "
+            f"devices fetch only part of the history, the rest is on the phone only. " + export_instructions())
 
 
 _wa.list_messages = list_messages
@@ -228,7 +293,7 @@ def _register_tools(mcp) -> None:
 
     @mcp.tool()
     def request_older_messages(chat_jid: str, count: int = 50, from_newest: bool = False,
-                               wait: bool = True) -> Dict[str, Any]:
+                               wait: bool = True, force: bool = False) -> Dict[str, Any]:
         """Request older history for one chat from the user's own phone.
 
         Fetches `count` (max 100; the phone sends at most 50 per answer) messages older
@@ -243,6 +308,10 @@ def _register_tools(mcp) -> None:
           status "no_access"          – the phone reports older messages this device may not get
           status "no_response"        – the phone did not answer (offline or ignored)
           status "rejected"           – the phone answered with an error response_code
+          status "phone_limit_known"  – the phone already refused to go further back for this
+                                        chat recently; nothing was sent (force=True asks again)
+        When the phone keeps older messages to itself, "user_message" explains it in plain
+        language and how to export the chat from the phone for import_chat_export: pass it on.
         Also returned: phone_responded, response_code, received_count, new_messages (not
         stored before; the phone sometimes re-sends known ones), history_exhausted,
         anchor_used and the individual attempts. If the phone answers with nothing, other
@@ -260,9 +329,17 @@ def _register_tools(mcp) -> None:
                 older ones (useful for picking up reactions on recent messages)
             wait: if False, only send the request (status "sent") and return immediately;
                 messages arrive asynchronously
+            force: ask the phone even if it recently refused to go further back for this chat
         """
-        return _post("history", {"chat_jid": chat_jid, "count": count, "from_newest": from_newest,
-                                 "wait": wait}, timeout=90)
+        res = _post("history", {"chat_jid": chat_jid, "count": count, "from_newest": from_newest,
+                                "wait": wait, "force": force}, timeout=90)
+        if res.get("status") in ("phone_sent_nothing", "no_access", "phone_limit_known") and res.get("oldest_available"):
+            since = res["oldest_available"][:10]
+            res["user_message"] = (
+                f"WhatsApp does not let this linked device fetch messages older than {since} for this chat; "
+                "the older history is only on the phone (WhatsApp Web shows the same limit as \"Older messages can "
+                "be viewed in WhatsApp on your phone\"). " + export_instructions())
+        return res
 
     @mcp.tool()
     def get_reactions(chat_jid: str, query: Optional[str] = None, message_id: Optional[str] = None,
@@ -396,12 +473,53 @@ def _register_tools(mcp) -> None:
                     break
                 lines.append(line); used += len(line) + 1; n += 1
             done = offset + n >= total
-            return {"success": True, "chat_jid": chat_jid, "messages_in_range": total,
-                    "returned": n, "offset": offset,
-                    "next_offset": None if done else offset + n,
-                    "text": "\n".join(lines)}
+            out = {"success": True, "chat_jid": chat_jid, "messages_in_range": total,
+                   "returned": n, "offset": offset,
+                   "next_offset": None if done else offset + n,
+                   "text": "\n".join(lines)}
+            imported = sum(1 for r in rows[:n] if str(r[0]).startswith("import-"))
+            if imported:
+                out["imported_from_export"] = imported  # messages that came from a chat export file
+            if offset == 0:
+                note = history_limit_note(chat_jid, after)
+                if note:
+                    out["note"] = note
+            return out
         except sqlite3.Error as e:
-            return {"success": False, "message": f"Tietokantavirhe: {e}"}
+            return {"success": False, "message": f"Database error: {e}"}
+
+    @mcp.tool()
+    def list_chat_exports() -> Dict[str, Any]:
+        """List chat export files waiting in the export folder (WhatsApp → chat → Export chat).
+
+        Returns each file's name, size, modification time, the chat name guessed from the file
+        name and matching stored chats. Import one with import_chat_export.
+        """
+        return _list_exports()
+
+    @mcp.tool()
+    def import_chat_export(file_name: str, chat_jid: Optional[str] = None, me_name: Optional[str] = None,
+                           dry_run: bool = True, date_order: Optional[str] = None) -> Dict[str, Any]:
+        """Import a chat export file (from list_chat_exports) into the message store.
+
+        Use this for history WhatsApp keeps on the phone only. Only messages older than the
+        oldest message already stored for the chat are imported (the rest is already there),
+        and importing the same file twice adds nothing. Imported messages have IDs starting
+        with "import-"; reactions and media downloads are not available for them.
+
+        Always call with dry_run=True first (the default): it reports the date range, the
+        senders found and how many messages would be imported, without storing anything.
+        Show that to the user, then call again with dry_run=False.
+
+        Args:
+            file_name: file name as listed by list_chat_exports (.txt or .zip)
+            chat_jid: chat to import into; guessed from the file name if omitted
+            me_name: the user's own name as it appears in the export, if the dry run could
+                not tell which sender is the user
+            dry_run: True = only report what would be imported (default)
+            date_order: "dmy", "mdy" or "ymd" if the dry run guessed the date format wrongly
+        """
+        return _import_export(file_name, chat_jid, me_name, dry_run, date_order)
 
     @mcp.tool()
     def refresh_contact_names() -> Dict[str, Any]:
@@ -644,3 +762,157 @@ def _as_resource(path: str, meta: str):
         data = base64.b64encode(f.read()).decode()
     return [meta, EmbeddedResource(type="resource", resource=BlobResourceContents(
         uri=f"file://{path}", mimeType=mime, blob=data))]
+
+
+# --- chat export import ------------------------------------------------------------------------
+
+def _export_dir_error() -> Optional[Dict[str, Any]]:
+    if not EXPORT_DIR:
+        return {"success": False, "message": "No export folder configured (WHATSAPP_EXPORT_DIR is not set on the server)."}
+    try:
+        os.listdir(EXPORT_DIR)
+    except PermissionError:
+        return {"success": False, "message": (
+            f"The MCP server is not allowed to read {EXPORT_DIR}. On macOS, give the server's Python "
+            f"Full Disk Access (System Settings → Privacy & Security), then restart the MCP service.")}
+    except OSError as e:
+        return {"success": False, "message": f"Cannot read the export folder {EXPORT_DIR}: {e}"}
+    return None
+
+
+def _chats_named(name: str) -> List[Dict[str, str]]:
+    conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT jid, name FROM chats WHERE LOWER(name) = LOWER(?) ORDER BY last_message_time DESC",
+                            (name,)).fetchall()
+        if not rows:
+            rows = conn.execute("SELECT jid, name FROM chats WHERE LOWER(name) LIKE LOWER(?) "
+                                "ORDER BY last_message_time DESC LIMIT 5", (f"%{name}%",)).fetchall()
+    finally:
+        conn.close()
+    return [{"jid": r[0], "name": r[1]} for r in rows]
+
+
+def _list_exports() -> Dict[str, Any]:
+    err = _export_dir_error()
+    if err:
+        return err
+    files = []
+    for name in sorted(os.listdir(EXPORT_DIR)):
+        path = os.path.join(EXPORT_DIR, name)
+        if name.startswith(".") or not os.path.isfile(path) or not name.lower().endswith((".txt", ".zip")):
+            continue
+        st = os.stat(path)
+        guess = chat_import.guess_chat_name(name)
+        files.append({"file_name": name, "bytes": st.st_size,
+                      "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="minutes"),
+                      "chat_name_guess": guess, "matching_chats": _chats_named(guess)})
+    return {"success": True, "folder": EXPORT_DIR_LABEL, "files": files,
+            "hint": "Import with import_chat_export(file_name, chat_jid), dry_run first." if files
+                    else "No export files found. " + export_instructions()}
+
+
+def _import_export(file_name: str, chat_jid: Optional[str], me_name: Optional[str],
+                   dry_run: bool, date_order: Optional[str]) -> Dict[str, Any]:
+    err = _export_dir_error()
+    if err:
+        return err
+    if os.path.basename(file_name) != file_name:
+        return {"success": False, "message": "file_name must be a plain file name from list_chat_exports"}
+    path = os.path.join(EXPORT_DIR, file_name)
+    if not os.path.isfile(path):
+        return {"success": False, "message": f"{file_name} not found in {EXPORT_DIR_LABEL}"}
+    if date_order not in (None, "dmy", "mdy", "ymd"):
+        return {"success": False, "message": "date_order must be dmy, mdy or ymd"}
+
+    if not chat_jid:
+        candidates = _chats_named(chat_import.guess_chat_name(file_name))
+        if len(candidates) != 1:
+            return {"success": False, "message": "Could not tell which chat this export belongs to; pass chat_jid.",
+                    "candidates": candidates}
+        chat_jid = candidates[0]["jid"]
+
+    try:
+        parsed = chat_import.parse_export(chat_import.read_export_text(path), date_order=date_order)
+    except (OSError, ValueError, KeyError) as e:
+        return {"success": False, "message": f"Could not read {file_name}: {e}"}
+    if not parsed.messages:
+        return {"success": False, "message": "No messages recognised in the file (unsupported export format?)",
+                "unparsed_lines": parsed.unparsed_lines}
+
+    jids = chat_jids(chat_jid)
+    marks = ",".join("?" * len(jids))
+    conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+    try:
+        chat = conn.execute("SELECT name FROM chats WHERE jid = ?", (chat_jid,)).fetchone()
+        oldest_ts = conn.execute(f"SELECT timestamp FROM messages WHERE chat_jid IN ({marks}) AND id NOT LIKE 'import-%' "
+                                 f"ORDER BY julianday(timestamp) ASC LIMIT 1", jids).fetchone()
+        own = conn.execute("SELECT sender FROM messages WHERE is_from_me = 1 AND sender NOT LIKE '%@%' AND sender != '' "
+                           "GROUP BY sender ORDER BY count(*) DESC LIMIT 1").fetchone()
+        name_rows = conn.execute("SELECT name, lid FROM lid_names WHERE name != ''").fetchall()
+        name_rows += conn.execute("SELECT name, substr(jid, 1, instr(jid, '@') - 1) FROM chats "
+                                  "WHERE jid LIKE '%@s.whatsapp.net' AND name != ''").fetchall()
+    finally:
+        conn.close()
+    chat_name = chat[0] if chat else ""
+    is_group = chat_jid.endswith("@g.us")
+    known = {}
+    for n, user in name_rows:
+        known.setdefault(n.casefold(), user)
+
+    # Which sender is the user?
+    senders = parsed.senders()
+    me = {n.casefold() for n in ([me_name] if me_name else MY_EXPORT_NAMES)}
+    me |= {"you", "sinä", "minä"} & {s.casefold() for s in senders}
+    if not (me & {s.casefold() for s in senders}) and not is_group and len(senders) == 2 and chat_name:
+        others = [s for s in senders if s.casefold() != chat_name.casefold()]
+        if len(others) == 1:
+            me = {others[0].casefold()}
+    if not (me & {s.casefold() for s in senders}) and len(senders) > 1:
+        return {"success": False, "chat_jid": chat_jid, "senders": senders,
+                "message": "Could not tell which sender is the user; call again with me_name (one of the senders)."}
+
+    def sender_of(name: str) -> Tuple[str, bool]:
+        if name.casefold() in me:
+            return (own[0] if own else ""), True
+        if not is_group:
+            return chat_jid.split("@")[0], False
+        return known.get(name.casefold(), name), False
+
+    # Only what is older than the oldest stored WhatsApp message (the rest is stored already)
+    cutoff = None
+    if oldest_ts:
+        cutoff = datetime.fromisoformat(str(oldest_ts[0])).replace(second=0, microsecond=0)
+    picked = [m for m in parsed.messages if cutoff is None or m.timestamp < cutoff]
+    roles = [sender_of(m.sender) for m in picked]
+    ids = chat_import.import_ids(chat_jid, picked, [r[1] for r in roles])
+
+    summary: Dict[str, Any] = {
+        "success": True, "dry_run": dry_run, "file_name": file_name, "chat_jid": chat_jid, "chat_name": chat_name,
+        "date_format": parsed.date_order, "messages_in_file": len(parsed.messages),
+        "file_range": [parsed.messages[0].timestamp.isoformat(), parsed.messages[-1].timestamp.isoformat()],
+        "stored_from": cutoff.isoformat() if cutoff else None,
+        "to_import": len(picked),
+        "import_range": [picked[0].timestamp.isoformat(), picked[-1].timestamp.isoformat()] if picked else None,
+        "skipped_already_stored": len(parsed.messages) - len(picked),
+        "senders": {n: {"messages": c, "is_me": n.casefold() in me} for n, c in senders.items()},
+        "system_lines_skipped": parsed.system_lines, "unrecognised_lines": parsed.unparsed_lines,
+    }
+    if dry_run or not picked:
+        if dry_run:
+            summary["next"] = "Check the range and senders, then call again with dry_run=False to import."
+        return summary
+
+    inserted = 0
+    for i in range(0, len(picked), 2000):
+        batch = [{"id": ids[j], "timestamp": picked[j].timestamp.isoformat(), "sender": roles[j][0],
+                  "is_from_me": roles[j][1], "content": picked[j].text} for j in range(i, min(i + 2000, len(picked)))]
+        res = _post("import", {"chat_jid": chat_jid, "chat_name": chat_name, "source": file_name, "messages": batch},
+                    timeout=120)
+        if not res.get("success"):
+            summary.update({"success": False, "inserted": inserted, "message": f"Import stopped: {res.get('message')}"})
+            return summary
+        inserted += res.get("inserted", 0)
+    summary.update({"inserted": inserted, "already_present": len(picked) - inserted,
+                    "message": f"Imported {inserted} messages from {file_name}. The file can be deleted from the export folder."})
+    return summary
