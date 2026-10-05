@@ -39,6 +39,16 @@ func startImportExtras(store *MessageStore, logger waLog.Logger) {
 			response_code TEXT,
 			checked_at TIMESTAMP
 		)`,
+		// Extra per-message data from imports (starred, quoted message, media details, text, ...)
+		// as JSON. Upstream never touches this table, so it survives the bridge re-storing a message.
+		`CREATE TABLE IF NOT EXISTS message_metadata (
+			message_id TEXT,
+			chat_jid TEXT,
+			source TEXT,
+			data TEXT,
+			updated_at TIMESTAMP,
+			PRIMARY KEY (message_id, chat_jid, source)
+		)`,
 		`CREATE TABLE IF NOT EXISTS message_imports (
 			message_id TEXT,
 			chat_jid TEXT,
@@ -101,12 +111,14 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 		KeepIDs  bool   `json:"keep_ids"`
 		Source   string `json:"source"`
 		Messages []struct {
-			ID        string    `json:"id"`
-			Timestamp time.Time `json:"timestamp"`
-			Sender    string    `json:"sender"`
-			IsFromMe  bool      `json:"is_from_me"`
-			Content   string    `json:"content"`
-			MediaType string    `json:"media_type"`
+			ID        string          `json:"id"`
+			Timestamp time.Time       `json:"timestamp"`
+			Sender    string          `json:"sender"`
+			IsFromMe  bool            `json:"is_from_me"`
+			Content   string          `json:"content"`
+			MediaType string          `json:"media_type"`
+			Filename  string          `json:"filename"`
+			Metadata  json.RawMessage `json:"metadata"` // stored in message_metadata under source
 		} `json:"messages"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
@@ -155,14 +167,43 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 
 	now := time.Now()
 	inserted := 0
+	filled, withMetadata := 0, 0
 	for _, m := range req.Messages {
 		var res sql.Result
-		var mediaType any
-		if m.MediaType != "" {
-			mediaType = m.MediaType
+		nullable := func(v string) any {
+			if v == "" {
+				return nil
+			}
+			return v
 		}
-		res, err = tx.Exec(`INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			m.ID, req.ChatJID, m.Sender, m.Content, m.Timestamp, m.IsFromMe, mediaType)
+		if len(m.Metadata) > 0 && string(m.Metadata) != "null" {
+			if _, err = tx.Exec(`INSERT INTO message_metadata (message_id, chat_jid, source, data, updated_at) VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT(message_id, chat_jid, source) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
+				m.ID, req.ChatJID, req.Source, string(m.Metadata), now); err != nil {
+				break
+			}
+			withMetadata++
+		}
+		// An existing message is never overwritten; only its empty fields are filled in
+		res, err = tx.Exec(`UPDATE messages SET
+				content = CASE WHEN COALESCE(content, '') = '' THEN ? ELSE content END,
+				media_type = COALESCE(NULLIF(media_type, ''), ?),
+				filename = COALESCE(NULLIF(filename, ''), ?),
+				sender = COALESCE(NULLIF(sender, ''), ?)
+			WHERE id = ? AND chat_jid = ? AND (
+				(COALESCE(content, '') = '' AND ? != '') OR (COALESCE(media_type, '') = '' AND ? != '') OR
+				(COALESCE(filename, '') = '' AND ? != '') OR (COALESCE(sender, '') = '' AND ? != ''))`,
+			m.Content, nullable(m.MediaType), nullable(m.Filename), nullable(m.Sender), m.ID, req.ChatJID,
+			m.Content, m.MediaType, m.Filename, m.Sender)
+		if err != nil {
+			break
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			filled++
+			continue
+		}
+		res, err = tx.Exec(`INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			m.ID, req.ChatJID, m.Sender, m.Content, m.Timestamp, m.IsFromMe, nullable(m.MediaType), nullable(m.Filename))
 		if err != nil {
 			break
 		}
@@ -190,10 +231,11 @@ func handleImport(store *MessageStore, logger waLog.Logger, w http.ResponseWrite
 	if err != nil {
 		logger.Warnf("extras: duplicate cleanup failed for %s: %v", req.ChatJID, err)
 	}
-	logger.Infof("extras: imported %d of %d messages into %s", inserted, len(req.Messages), req.ChatJID)
+	logger.Infof("extras: imported %d of %d messages into %s (%d filled in, %d duplicates removed)",
+		inserted, len(req.Messages), req.ChatJID, filled, removed)
 	writeExtrasJSON(w, http.StatusOK, map[string]any{
-		"success": true, "chat_jid": req.ChatJID, "received": len(req.Messages), "inserted": inserted, "duplicates_removed": removed,
-		"already_present": len(req.Messages) - inserted,
+		"success": true, "chat_jid": req.ChatJID, "received": len(req.Messages), "inserted": inserted, "filled": filled, "with_metadata": withMetadata, "duplicates_removed": removed,
+		"already_present": len(req.Messages) - inserted - filled,
 	})
 }
 
@@ -278,4 +320,21 @@ func removeImportDuplicates(store *MessageStore, chatJID string) (int64, error) 
 			args(1)...)
 	}
 	return total, err
+}
+
+// restoreTextFromMetadata puts back message text that an import supplied (message_metadata
+// "text") when upstream has since re-stored the message without it (INSERT OR REPLACE).
+func restoreTextFromMetadata(store *MessageStore, chatJID string) (int64, error) {
+	res, err := store.db.Exec(`
+		UPDATE messages SET content = (
+			SELECT json_extract(md.data, '$.text') FROM message_metadata md
+			WHERE md.message_id = messages.id AND md.chat_jid = messages.chat_jid
+			  AND COALESCE(json_extract(md.data, '$.text'), '') != '' LIMIT 1)
+		WHERE chat_jid = ? AND COALESCE(content, '') = ''
+		  AND EXISTS (SELECT 1 FROM message_metadata md WHERE md.message_id = messages.id AND md.chat_jid = messages.chat_jid
+		              AND COALESCE(json_extract(md.data, '$.text'), '') != '')`, chatJID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

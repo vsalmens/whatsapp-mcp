@@ -62,6 +62,9 @@ func startOnDemandHistoryLogging(client *whatsmeow.Client, store *MessageStore, 
 					}
 				}
 				unmarkImported(store, conv.GetID(), ids)
+				if _, err := restoreTextFromMetadata(store, conv.GetID()); err != nil {
+					logger.Warnf("extras: restoring imported text failed for %s: %v", conv.GetID(), err)
+				}
 				if n, err := removeImportDuplicates(store, conv.GetID()); err != nil {
 					logger.Warnf("extras: duplicate cleanup failed for %s: %v", conv.GetID(), err)
 				} else if n > 0 {

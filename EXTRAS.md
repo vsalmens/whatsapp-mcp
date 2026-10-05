@@ -146,3 +146,15 @@ again) with a `user_message` explaining it. To add that history:
 
 Only messages older than the oldest stored WhatsApp message are imported, with IDs
 `import-<hash>`, so repeating an import adds nothing. They have no reactions or media.
+
+### Importing from a local iPhone backup
+
+The phone's own WhatsApp database has the complete history with real message IDs. Make an
+unencrypted local backup (e.g. `idevicebackup2 backup --full <dir>` from `libimobiledevice`, no
+Full Disk Access needed), take `ChatStorage.sqlite` (domain
+`AppDomainGroup-group.net.whatsapp.WhatsApp.shared`, file ID = SHA-1 of
+`AppDomainGroup-group.net.whatsapp.WhatsApp.shared-ChatStorage.sqlite`), copy it to the bridge host
+and run `python3 scripts/import-ios-backup.py --chatstorage <file>` (dry run; add `--apply`).
+Existing messages are never overwritten, only empty fields are filled; extra data (starred,
+quoted message, media details) goes to `message_metadata`. Re-running adds nothing.
+Delete the backup and the copied database afterwards: they contain all messages.
