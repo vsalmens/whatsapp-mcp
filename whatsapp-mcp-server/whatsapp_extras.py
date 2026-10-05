@@ -234,7 +234,7 @@ def _register_tools(mcp) -> None:
         Fetches `count` (max 100; the phone sends at most 50 per answer) messages older
         than the oldest message stored for this chat, waits up to ~15 s for the phone's
         answer and reports what happened:
-          status "received"           – messages arrived and are stored (call list_messages)
+          status "received"           – new messages arrived and are stored (call list_messages)
           status "history_exhausted"  – the phone answered with zero messages and nothing
                                         older remains for this chat
           status "phone_sent_nothing" – zero messages although the phone reports that older
@@ -243,7 +243,8 @@ def _register_tools(mcp) -> None:
           status "no_access"          – the phone reports older messages this device may not get
           status "no_response"        – the phone did not answer (offline or ignored)
           status "rejected"           – the phone answered with an error response_code
-        Also returned: phone_responded, response_code, received_count, history_exhausted,
+        Also returned: phone_responded, response_code, received_count, new_messages (not
+        stored before; the phone sometimes re-sends known ones), history_exhausted,
         anchor_used and the individual attempts. If the phone answers with nothing, other
         anchors (and, for 1:1 chats, the contact's LID/phone-number JID) are tried
         automatically. Repeat the call to go further back.

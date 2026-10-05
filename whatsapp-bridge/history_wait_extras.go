@@ -241,6 +241,7 @@ type historyAttempt struct {
 	PhoneResponded bool   `json:"phone_responded"`
 	ResponseChat   string `json:"response_chat,omitempty"`
 	Received       int    `json:"received_count"`
+	New            int    `json:"new_messages"` // received messages that were not stored before
 	EndOfHistory   bool   `json:"end_of_history,omitempty"`
 	EndType        string `json:"end_of_history_type,omitempty"`
 	PeerCode       string `json:"response_code,omitempty"`
@@ -365,6 +366,12 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		plan = append(plan, step{targets[1], anchors[0]})
 	}
 
+	countStored := func() int {
+		n := 0
+		_ = store.db.QueryRow(`SELECT count(*) FROM messages WHERE chat_jid IN (?, ?)`, stored[0], stored[len(stored)-1]).Scan(&n)
+		return n
+	}
+
 	var attempts []historyAttempt
 	deadline := time.Now().Add(historyTotalBudget)
 	for i, st := range plan {
@@ -376,6 +383,7 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 			<-waiter.ch
 		}
 		a := st.anchor
+		before := countStored()
 		codeCh := make(chan string, 1)
 		reqID, err := sendHistoryRequest(ctx, client, st.target, a, req.Count)
 		if err != nil {
@@ -423,12 +431,15 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		}
 		timer.Stop()
 		peerCodeWaiters.Delete(reqID)
+		if att.Received > 0 {
+			att.New = countStored() - before // upstream stores the batch before our handler runs
+		}
 		attempts = append(attempts, att)
 
 		if i == 0 && !att.PhoneResponded {
 			break // the phone is offline or ignores requests; other anchors will not help
 		}
-		if att.Received > 0 || phoneSaysNoMore(att.EndType) || anchorless ||
+		if att.New > 0 || phoneSaysNoMore(att.EndType) || anchorless ||
 			(att.PeerCode != "" && att.PeerCode != "REQUEST_SUCCESS") {
 			break
 		}
@@ -436,12 +447,13 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 
 	// Report the most informative attempt: one that got messages, else the last answered one
 	best := attempts[len(attempts)-1]
-	responded, received := false, 0
+	responded, received, newMsgs := false, 0, 0
 	for _, at := range attempts {
 		received += at.Received
+		newMsgs += at.New
 		if at.PhoneResponded {
 			responded = true
-			if best.Received == 0 && (at.Received > 0 || !best.PhoneResponded) {
+			if best.New == 0 && (at.New > 0 || !best.PhoneResponded) {
 				best = at
 			}
 		}
@@ -463,9 +475,9 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 	case !responded:
 		status = "no_response"
 		msg = fmt.Sprintf("No response from phone within %d s - phone offline or request ignored.", int(perWait.Seconds()))
-	case received > 0:
+	case newMsgs > 0:
 		status = "received"
-		msg = fmt.Sprintf("The phone sent %d messages; they are stored now (list_messages).", received)
+		msg = fmt.Sprintf("The phone sent %d new messages; they are stored now (list_messages).", newMsgs)
 	case best.PeerCode != "" && best.PeerCode != "REQUEST_SUCCESS":
 		status = "rejected"
 		msg = "The phone rejected the request (response_code " + best.PeerCode + ")."
@@ -474,7 +486,7 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		msg = "The phone has older messages for this chat but reports that this device has no access to them."
 	case best.EndType == waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY.String():
 		status = "phone_sent_nothing"
-		msg = fmt.Sprintf("The phone answered %d anchor(s) with zero messages although it reports that more messages remain "+
+		msg = fmt.Sprintf("The phone answered %d anchor(s) with no new messages although it reports that more messages remain "+
 			"on the phone (%s). Other anchors did not help; the phone declines to send older messages for this chat.",
 			len(attempts)-ignored, best.EndType)
 	default:
@@ -485,11 +497,14 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		}
 		msg += "."
 	}
+	if received > newMsgs {
+		msg += fmt.Sprintf(" %d received message(s) were already stored.", received-newMsgs)
+	}
 	if ignored > 0 && responded {
 		msg += fmt.Sprintf(" %d attempt(s) got no answer within the wait time (e.g. requests addressed to the LID JID).", ignored)
 	}
-	logger.Infof("extras: history request %s finished: status=%s attempts=%d received=%d response=%s",
-		req.ChatJID, status, len(attempts), received, valueOr(responseCode, "-"))
+	logger.Infof("extras: history request %s finished: status=%s attempts=%d received=%d new=%d response=%s",
+		req.ChatJID, status, len(attempts), received, newMsgs, valueOr(responseCode, "-"))
 
 	writeExtrasJSON(w, http.StatusOK, map[string]any{
 		"success":           true,
@@ -498,6 +513,7 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		"phone_responded":   responded,
 		"response_code":     responseCode,
 		"received_count":    received,
+		"new_messages":      newMsgs,
 		"history_exhausted": exhausted,
 		"anchorless":        anchorless,
 		"anchor_used": map[string]any{
