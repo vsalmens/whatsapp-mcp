@@ -11,11 +11,11 @@ package main
 // "more messages remain / no more / no access" flag), history_exhausted and anchor_used.
 // If the phone answers with zero messages without saying that nothing remains, the request is
 // retried with other anchors (the oldest message sent by the user, the next-oldest ones) and,
-// for 1:1 chats, with the alternate LID / phone-number JID of the same contact.
-// If the phone does not answer at all, the handler says so instead of retrying.
+// for 1:1 chats, once with the alternate LID / phone-number JID of the same contact.
+// If the phone does not answer the first request at all, the handler says so instead of retrying.
 //
-// Answers are matched to requests by chat JID (the history sync carries no request ID that
-// whatsmeow exposes reliably), so a late answer to an earlier request may be counted once.
+// Answers are matched by chat JID and by the sync notification's session ID, which the phone
+// sets to the request's message ID.
 
 import (
 	"context"
@@ -351,112 +351,142 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 	waiter, done := addOnDemandWaiter(stored)
 	defer done()
 
+	// Plan: every anchor under the chat JID as given (the phone answers these within seconds),
+	// then the first anchor under the alternate LID/PN JID.
+	type step struct {
+		target types.JID
+		anchor historyAnchor
+	}
+	var plan []step
+	for _, a := range anchors {
+		plan = append(plan, step{chat, a})
+	}
+	if len(targets) > 1 && !anchorless {
+		plan = append(plan, step{targets[1], anchors[0]})
+	}
+
 	var attempts []historyAttempt
 	deadline := time.Now().Add(historyTotalBudget)
-	noResponse := false
-	stop := false
-	for _, a := range anchors {
-		for _, target := range targets {
-			if stop || len(attempts) >= historyMaxAttempts || time.Now().After(deadline) {
-				stop = true
-				break
-			}
-			// Drop late answers to earlier attempts
-			for len(waiter.ch) > 0 {
-				<-waiter.ch
-			}
-			codeCh := make(chan string, 1)
-			reqID, err := sendHistoryRequest(ctx, client, target, a, req.Count)
-			if err != nil {
-				logger.Warnf("extras: history request failed (%s): %v", target, err)
-				writeExtrasJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "failed to send the request to the phone: " + err.Error(), "attempts": attempts})
-				return
-			}
-			peerCodeWaiters.Store(reqID, codeCh)
-			logger.Infof("extras: requested %d messages before %s in %s (anchor=%s from_me=%v request_id=%s)",
-				req.Count, a.TS.Format(time.RFC3339), target, valueOr(a.ID, "-"), a.FromMe, reqID)
+	for i, st := range plan {
+		if i >= historyMaxAttempts || time.Now().After(deadline) {
+			break
+		}
+		// Drop late answers to earlier attempts
+		for len(waiter.ch) > 0 {
+			<-waiter.ch
+		}
+		a := st.anchor
+		codeCh := make(chan string, 1)
+		reqID, err := sendHistoryRequest(ctx, client, st.target, a, req.Count)
+		if err != nil {
+			logger.Warnf("extras: history request failed (%s): %v", st.target, err)
+			writeExtrasJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "failed to send the request to the phone: " + err.Error(), "attempts": attempts})
+			return
+		}
+		peerCodeWaiters.Store(reqID, codeCh)
+		logger.Infof("extras: requested %d messages before %s in %s (anchor=%s from_me=%v request_id=%s)",
+			req.Count, a.TS.Format(time.RFC3339), st.target, valueOr(a.ID, "-"), a.FromMe, reqID)
 
-			att := historyAttempt{AnchorID: a.ID, AnchorTime: a.TS.Format(time.RFC3339), AnchorFromMe: a.FromMe,
-				SentAsChat: target.String(), RequestID: reqID}
-			timeout := perWait
-			if rem := time.Until(deadline); rem < timeout {
-				timeout = rem
-			}
-			timer := time.NewTimer(timeout)
-		waitLoop:
-			for {
-				select {
-				case code := <-codeCh:
-					att.PeerCode = code // a rejection may come without a history sync
-					if code != "" && code != "REQUEST_SUCCESS" {
-						att.PhoneResponded = true
-						break waitLoop
-					}
-				case res := <-waiter.ch:
+		att := historyAttempt{AnchorID: a.ID, AnchorTime: a.TS.Format(time.RFC3339), AnchorFromMe: a.FromMe,
+			SentAsChat: st.target.String(), RequestID: reqID}
+		timeout := perWait
+		if rem := time.Until(deadline); rem < timeout {
+			timeout = rem
+		}
+		timer := time.NewTimer(timeout)
+	waitLoop:
+		for {
+			select {
+			case code := <-codeCh:
+				att.PeerCode = code // a rejection may come without a history sync
+				if code != "" && code != "REQUEST_SUCCESS" {
 					att.PhoneResponded = true
-					att.ResponseChat, att.Received = res.ChatJID, res.Received
-					att.EndOfHistory, att.EndType = res.EndOfHistory, res.EndType
-					if !res.Oldest.IsZero() {
-						att.Oldest = res.Oldest.Format(time.RFC3339)
-					}
-					break waitLoop
-				case <-timer.C:
-					break waitLoop
-				case <-ctx.Done():
 					break waitLoop
 				}
-			}
-			timer.Stop()
-			peerCodeWaiters.Delete(reqID)
-			attempts = append(attempts, att)
-
-			switch {
-			case !att.PhoneResponded:
-				noResponse, stop = true, true // another anchor will not wake up an offline phone
-			case att.Received > 0, phoneSaysNoMore(att.EndType), anchorless, att.PeerCode != "" && att.PeerCode != "REQUEST_SUCCESS":
-				stop = true
+			case res := <-waiter.ch:
+				// The sync carries our request ID as its session ID; skip answers to other requests
+				if res.SessionID != "" && res.SessionID != reqID {
+					continue
+				}
+				att.PhoneResponded = true
+				att.ResponseChat, att.Received = res.ChatJID, res.Received
+				att.EndOfHistory, att.EndType = res.EndOfHistory, res.EndType
+				if !res.Oldest.IsZero() {
+					att.Oldest = res.Oldest.Format(time.RFC3339)
+				}
+				break waitLoop
+			case <-timer.C:
+				break waitLoop
+			case <-ctx.Done():
+				break waitLoop
 			}
 		}
-		if stop {
+		timer.Stop()
+		peerCodeWaiters.Delete(reqID)
+		attempts = append(attempts, att)
+
+		if i == 0 && !att.PhoneResponded {
+			break // the phone is offline or ignores requests; other anchors will not help
+		}
+		if att.Received > 0 || phoneSaysNoMore(att.EndType) || anchorless ||
+			(att.PeerCode != "" && att.PeerCode != "REQUEST_SUCCESS") {
 			break
 		}
 	}
 
-	last := attempts[len(attempts)-1]
-	received := 0
-	allZero := true
-	for _, a := range attempts {
-		received += a.Received
-		if !a.PhoneResponded || a.Received > 0 {
-			allZero = false
+	// Report the most informative attempt: one that got messages, else the last answered one
+	best := attempts[len(attempts)-1]
+	responded, received := false, 0
+	for _, at := range attempts {
+		received += at.Received
+		if at.PhoneResponded {
+			responded = true
+			if best.Received == 0 && (at.Received > 0 || !best.PhoneResponded) {
+				best = at
+			}
 		}
 	}
-	responseCode := last.PeerCode
-	if responseCode == "" {
-		responseCode = last.EndType
+	responseCode := best.PeerCode
+	if responseCode == "" || responseCode == "REQUEST_SUCCESS" && best.EndType != "" {
+		responseCode = best.EndType
+	}
+	ignored := 0
+	for _, at := range attempts {
+		if !at.PhoneResponded {
+			ignored++
+		}
 	}
 
 	var status, msg string
+	exhausted := false
 	switch {
-	case noResponse && len(attempts) == 1:
+	case !responded:
 		status = "no_response"
 		msg = fmt.Sprintf("No response from phone within %d s - phone offline or request ignored.", int(perWait.Seconds()))
 	case received > 0:
 		status = "received"
 		msg = fmt.Sprintf("The phone sent %d messages; they are stored now (list_messages).", received)
-	case allZero:
-		status = "history_exhausted"
-		msg = "The phone answered with zero messages for every anchor tried: it has nothing older to give for this chat"
-		if last.EndType != "" {
-			msg += " (phone reports " + last.EndType + ")"
+	case best.PeerCode != "" && best.PeerCode != "REQUEST_SUCCESS":
+		status = "rejected"
+		msg = "The phone rejected the request (response_code " + best.PeerCode + ")."
+	case best.EndType == waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS.String():
+		status = "no_access"
+		msg = "The phone has older messages for this chat but reports that this device has no access to them."
+	case best.EndType == waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY.String():
+		status = "phone_sent_nothing"
+		msg = fmt.Sprintf("The phone answered %d anchor(s) with zero messages although it reports that more messages remain "+
+			"on the phone (%s). Other anchors did not help; the phone declines to send older messages for this chat.",
+			len(attempts)-ignored, best.EndType)
+	default:
+		status, exhausted = "history_exhausted", true
+		msg = "The phone answered with zero messages: it has nothing older for this chat"
+		if best.EndType != "" {
+			msg += " (" + best.EndType + ")"
 		}
 		msg += "."
-	case noResponse:
-		status = "no_response"
-		msg = "The phone answered earlier attempts with zero messages and then stopped answering."
-	default:
-		status = "rejected"
-		msg = "The phone rejected the request (response_code " + responseCode + ")."
+	}
+	if ignored > 0 && responded {
+		msg += fmt.Sprintf(" %d attempt(s) got no answer within the wait time (e.g. requests addressed to the LID JID).", ignored)
 	}
 	logger.Infof("extras: history request %s finished: status=%s attempts=%d received=%d response=%s",
 		req.ChatJID, status, len(attempts), received, valueOr(responseCode, "-"))
@@ -465,13 +495,13 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		"success":           true,
 		"status":            status,
 		"message":           msg,
-		"phone_responded":   last.PhoneResponded,
+		"phone_responded":   responded,
 		"response_code":     responseCode,
 		"received_count":    received,
-		"history_exhausted": allZero,
+		"history_exhausted": exhausted,
 		"anchorless":        anchorless,
 		"anchor_used": map[string]any{
-			"id": last.AnchorID, "timestamp": last.AnchorTime, "from_me": last.AnchorFromMe, "sent_as_chat": last.SentAsChat,
+			"id": best.AnchorID, "timestamp": best.AnchorTime, "from_me": best.AnchorFromMe, "sent_as_chat": best.SentAsChat,
 		},
 		"attempts":  attempts,
 		"requested": req.Count,
