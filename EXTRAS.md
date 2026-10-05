@@ -36,6 +36,8 @@ on `127.0.0.1`.
 |---|---|
 | `whatsapp-bridge/lid_history.go` | `startExtras()` entry point, LID names, `/api/refresh_names` |
 | `whatsapp-bridge/history_wait_extras.go` | `/api/history`: waits for the phone's answer, anchor and LID/PN fallbacks; chat last-message-time repair |
+| `whatsapp-bridge/session_extras.go` | Exits after the phone logs the device out, so launchd restarts the bridge into QR mode |
+| `whatsapp-bridge/version_extras.go` | Build version (`VERSION` + commit count) in the log and at `/api/version` |
 | `whatsapp-bridge/device_props_extras.go` | Linking: asks the phone for the full history, registers as a desktop client, neutral device name (`WHATSAPP_DEVICE_NAME`) |
 | `whatsapp-bridge/import_extras.go` | `/api/import` for chat exports; `history_limits` and `message_imports` tables |
 | `whatsapp-mcp-server/chat_import.py` | Parser for *Export chat* text files (iPhone/Android, common locales) |
