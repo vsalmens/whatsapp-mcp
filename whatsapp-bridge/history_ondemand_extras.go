@@ -9,6 +9,7 @@ package main
 
 import (
 	"strings"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -22,6 +23,9 @@ func startOnDemandHistoryLogging(client *whatsmeow.Client, store *MessageStore, 
 		switch v := evt.(type) {
 		case *events.Message:
 			pm := v.Message.GetProtocolMessage()
+			if n := pm.GetHistorySyncNotification(); n != nil {
+				logHistorySyncNotification(n, logger)
+			}
 			if pm.GetType() != waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE {
 				return
 			}
@@ -56,4 +60,20 @@ func startOnDemandHistoryLogging(client *whatsmeow.Client, store *MessageStore, 
 			}
 		}
 	})
+}
+
+// logHistorySyncNotification logs the technical fields of a history sync notification (no message
+// content), before whatsmeow downloads it. A notification without a direct path cannot be
+// downloaded by whatsmeow ("no url present"); this shows what the phone sent instead.
+func logHistorySyncNotification(n *waE2E.HistorySyncNotification, logger waLog.Logger) {
+	var oldest string
+	if ts := n.GetOldestMsgInChunkTimestampSec(); ts > 0 {
+		oldest = time.Unix(ts, 0).Format(time.RFC3339)
+	}
+	logger.Infof("extras: history sync notification type=%s chunk=%d progress=%d direct_path=%v enc_handle=%d bytes "+
+		"inline_payload=%d bytes file_length=%d oldest_in_chunk=%s original_msg=%s session=%s access_complete=%v on_demand_request=%s",
+		n.GetSyncType(), n.GetChunkOrder(), n.GetProgress(), n.GetDirectPath() != "", len(n.GetEncHandle()),
+		len(n.GetInitialHistBootstrapInlinePayload()), n.GetFileLength(), valueOr(oldest, "-"),
+		valueOr(n.GetOriginalMessageID(), "-"), valueOr(n.GetPeerDataRequestSessionID(), "-"),
+		n.GetMessageAccessStatus().GetCompleteAccessGranted(), valueOr(n.GetFullHistorySyncOnDemandRequestMetadata().GetRequestID(), "-"))
 }
