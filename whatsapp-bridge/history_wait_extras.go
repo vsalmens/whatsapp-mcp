@@ -278,7 +278,9 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		AnchorMessageID string `json:"anchor_message_id"`
 		Wait            *bool  `json:"wait"`
 		Force           bool   `json:"force"` // ask the phone even if its limit for this chat is known
-		WaitSeconds     int    `json:"wait_seconds"`
+		// Experimental: no anchor message, only a time ("messages before this time")
+		AnchorTime  string `json:"anchor_time"`
+		WaitSeconds int    `json:"wait_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
 		writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "missing chat_jid or invalid request"})
@@ -316,12 +318,22 @@ func handleHistoryRequest(client *whatsmeow.Client, store *MessageStore, logger 
 		stored[i] = t.String()
 	}
 
-	anchors, err := anchorCandidates(store, stored, req.FromNewest, req.AnchorMessageID)
-	if err != nil {
+	var anchors []historyAnchor
+	anchorless := false
+	if req.AnchorTime != "" {
+		t, perr := time.Parse(time.RFC3339, req.AnchorTime)
+		if perr != nil {
+			if t, perr = time.ParseInLocation("2006-01-02", req.AnchorTime, time.Local); perr != nil {
+				writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "anchor_time must be RFC 3339 or YYYY-MM-DD"})
+				return
+			}
+		}
+		anchorless = true
+		anchors = []historyAnchor{{TS: t}}
+	} else if anchors, err = anchorCandidates(store, stored, req.FromNewest, req.AnchorMessageID); err != nil {
 		writeExtrasJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "database error: " + err.Error()})
 		return
 	}
-	anchorless := false
 	if len(anchors) == 0 {
 		if req.AnchorMessageID != "" {
 			writeExtrasJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "anchor message not found in this chat"})
