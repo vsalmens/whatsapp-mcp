@@ -119,6 +119,8 @@ PLIST
 
 for label in "$BRIDGE_LABEL" "$MCP_LABEL"; do
   launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  # bootout returns before the job is gone; bootstrapping too early fails with error 5
+  for _ in {1..20}; do launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 || break; sleep 0.5; done
   launchctl bootstrap "gui/$(id -u)" "$LA/$label.plist"
 done
 echo "✓ LaunchAgents loaded ($BRIDGE_LABEL, $MCP_LABEL)"
