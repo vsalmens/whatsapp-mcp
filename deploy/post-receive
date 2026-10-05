@@ -35,8 +35,10 @@ while read -r old new ref; do
   git --work-tree="$WORK" checkout -f "$BRANCH" || { echo "✗ checkout failed"; exit 1; }
 
   ok=1
-  rev="$(git rev-parse --short "$new")"   # before cd: hooks run with a relative GIT_DIR
-  ( cd "$WORK/whatsapp-bridge" && go build -ldflags "-X main.buildCommit=$rev -X main.buildTime=$(date +%Y-%m-%dT%H:%M:%S%z)" -o whatsapp-bridge.new . ) || ok=0
+  # Version major.minor.N: VERSION file + commit count. Computed before cd (hooks run with a relative GIT_DIR)
+  rev="$(git rev-parse --short "$new")"
+  ver="$(git show "$new:VERSION" 2>/dev/null | tr -d '[:space:]').$(git rev-list --count "$new")"
+  ( cd "$WORK/whatsapp-bridge" && go build -ldflags "-X main.buildVersion=$ver -X main.buildCommit=$rev -X main.buildTime=$(date +%Y-%m-%dT%H:%M:%S%z)" -o whatsapp-bridge.new . ) || ok=0
   if (( ok )); then
     ( cd "$WORK/whatsapp-mcp-server" && uv sync -q && uv run python -m py_compile main.py whatsapp_extras.py ) || ok=0
   fi
@@ -50,7 +52,7 @@ while read -r old new ref; do
     sleep 5
     tail -n 5 "$HOME/Library/Logs/whatsapp-bridge.log" 2>/dev/null | sed 's/^/   log: /'
     if (( restarted )); then
-      echo "✓ deployed $(git rev-parse --short "$new")"
+      echo "✓ deployed $ver ($(git rev-parse --short "$new"))"
     else
       echo "⚠ deployed $(git rev-parse --short "$new"), but services were not restarted (check labels: deploy.labelPrefix)"
       exit 1

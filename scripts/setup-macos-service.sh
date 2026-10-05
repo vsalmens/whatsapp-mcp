@@ -67,8 +67,10 @@ chmod 600 "$BRIDGE/store/.host"
 echo "✓ store/.host = $(cat "$BRIDGE/store/.host")"
 
 # --- 3) Build ---
+# Version major.minor.N (VERSION file + commit count); without a git checkout N is "0"
 COMMIT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-( cd "$BRIDGE" && "$GO" build -ldflags "-X main.buildCommit=$COMMIT -X main.buildTime=$(date +%Y-%m-%dT%H:%M:%S%z)" -o whatsapp-bridge . ) && echo "✓ bridge built"
+VER="$(tr -d '[:space:]' < "$REPO/VERSION" 2>/dev/null || echo 0.0).$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 0)"
+( cd "$BRIDGE" && "$GO" build -ldflags "-X main.buildVersion=$VER -X main.buildCommit=$COMMIT -X main.buildTime=$(date +%Y-%m-%dT%H:%M:%S%z)" -o whatsapp-bridge . ) && echo "✓ bridge built"
 ( cd "$SERVER" && "$UV" sync -q ) && echo "✓ Python environment synced"
 
 # --- 4) LaunchAgents ---
