@@ -175,7 +175,12 @@ def list_messages(after: Optional[str] = None, before: Optional[str] = None,
         where.append("messages.sender = ?"); params.append(sender_phone_number)
     if chat_jid:
         jids = chat_jids(chat_jid)
-        where.append(f"messages.chat_jid IN ({','.join('?' * len(jids))})"); params += jids
+        marks = ",".join("?" * len(jids))
+        where.append(f"messages.chat_jid IN ({marks})"); params += jids
+        if len(jids) > 1:
+            # The bridge sometimes stores one message under both JIDs of a contact: show it once
+            where.append(f"NOT EXISTS (SELECT 1 FROM messages d WHERE d.id = messages.id "
+                         f"AND d.chat_jid IN ({marks}) AND d.rowid < messages.rowid)"); params += jids
     if query:
         where.append("LOWER(messages.content) LIKE LOWER(?)"); params.append(f"%{query}%")
     sql = ("SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, "
@@ -438,6 +443,10 @@ def _register_tools(mcp) -> None:
             in_jids = f"({','.join('?' * len(jids))})"
             q = f"SELECT id, timestamp, sender, content, media_type, is_from_me FROM messages WHERE chat_jid IN {in_jids}"
             args: list = list(jids)
+            if len(jids) > 1:  # one message stored under both JIDs of a contact: once
+                q += (f" AND NOT EXISTS (SELECT 1 FROM messages d WHERE d.id = messages.id"
+                      f" AND d.chat_jid IN {in_jids} AND d.rowid < messages.rowid)")
+                args += jids
             if after:
                 q += " AND timestamp >= ?"; args.append(after)
             if before:

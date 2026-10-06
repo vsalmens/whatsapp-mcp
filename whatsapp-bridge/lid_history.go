@@ -85,6 +85,7 @@ func startExtras(client *whatsmeow.Client, store *MessageStore, logger waLog.Log
 	startMediaExtras(client, store, logger)    // media_extras.go
 	startReactionExtras(client, store, logger) // reactions_extras.go
 	startImportExtras(store, logger)           // import_extras.go
+	startMediaImportExtras(store, logger)      // media_import_extras.go
 	startVersionExtras(logger)                 // version_extras.go
 	startSessionExtras(client, logger)         // session_extras.go
 }

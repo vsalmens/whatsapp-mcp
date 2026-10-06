@@ -15,6 +15,11 @@ Run on the bridge host. Dry run by default; prints counts only, never message co
   python3 scripts/import-ios-backup.py --chatstorage /path/ChatStorage.sqlite --apply    # import
 Options: --chat JID (only this chat), --db (default whatsapp-bridge/store/messages.db),
          --api (default http://127.0.0.1:8080/api/import)
+
+Media (after the messages are imported): copy the backup's media files, laid out by their
+relative path (Message/Media/...), to a folder and run
+  python3 scripts/import-ios-backup.py --chatstorage ... --media audio --media-root <folder> [--apply]
+Types: audio, image, video, document, sticker, gif (comma-separated). Existing files are kept.
 """
 
 import argparse
@@ -22,6 +27,7 @@ import json
 import os
 import sqlite3
 import sys
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -62,7 +68,11 @@ def main() -> int:
     ap.add_argument("--source", default="ios-backup")
     ap.add_argument("--apply", action="store_true", help="import (default: dry run)")
     ap.add_argument("--batch", type=int, default=1000)
+    ap.add_argument("--media", help="import media files of these types instead of messages, e.g. audio,document")
+    ap.add_argument("--media-root", help="folder with the backup's media files (Message/Media/...)")
     args = ap.parse_args()
+    if args.media and not args.media_root:
+        ap.error("--media needs --media-root")
 
     # --- the bridge's current state (read-only) ---
     ours = sqlite3.connect(f"file:{os.path.abspath(args.db)}?mode=ro", uri=True)
@@ -94,6 +104,9 @@ def main() -> int:
             return jid
         alt = alternate(jid)
         return alt if alt in our_chats else jid
+
+    if args.media:
+        return import_media(args, stored, target_chat, alternate)
 
     # --- the phone's database (read-only) ---
     src = sqlite3.connect(f"file:{os.path.abspath(args.chatstorage)}?immutable=1", uri=True)
@@ -218,6 +231,58 @@ def main() -> int:
         if totals["chats"] % 50 == 0:
             print(f"  … {totals['chats']}/{len(per_chat)} chats")
     print("imported: " + ", ".join(f"{k} {v}" for k, v in totals.items()))
+    return 0
+
+
+MEDIA_TYPES = {"image": (1,), "video": (2,), "audio": (3,), "document": (8,), "gif": (11,), "sticker": (15,)}
+
+
+def import_media(args, stored, target_chat, alternate) -> int:
+    wanted = set()
+    for t in args.media.split(","):
+        if t.strip() not in MEDIA_TYPES:
+            print(f"unknown media type {t}; use {', '.join(MEDIA_TYPES)}")
+            return 1
+        wanted.update(MEDIA_TYPES[t.strip()])
+    src = sqlite3.connect(f"file:{os.path.abspath(args.chatstorage)}?immutable=1", uri=True)
+    marks = ",".join("?" * len(wanted))
+    rows = src.execute(f"""
+        SELECT m.ZSTANZAID, c.ZCONTACTJID, i.ZMEDIALOCALPATH FROM ZWAMESSAGE m
+        JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION JOIN ZWAMEDIAITEM i ON i.Z_PK = m.ZMEDIAITEM
+        WHERE m.ZMESSAGETYPE IN ({marks}) AND COALESCE(i.ZMEDIALOCALPATH, '') != ''""", list(wanted)).fetchall()
+    src.close()
+    api = args.api.rsplit("/", 1)[0] + "/import_media"
+    stats = Counter()
+    size = 0
+    for mid, jid, local in rows:
+        if args.chat and args.chat not in (jid, target_chat(jid), alternate(jid)):
+            continue
+        path = os.path.join(args.media_root, "Message", local)
+        if not os.path.isfile(path):
+            stats["file missing"] += 1
+            continue
+        chats = stored.get(mid, set()) & ({target_chat(jid), jid, alternate(jid)} - {""})
+        if not chats:
+            stats["message not stored"] += 1
+            continue
+        stats["to import"] += 1
+        size += os.path.getsize(path)
+        if not args.apply:
+            continue
+        q = urllib.parse.urlencode({"chat_jid": sorted(chats)[0], "message_id": mid, "name": os.path.basename(local)})
+        with open(path, "rb") as f:
+            req = urllib.request.Request(f"{api}?{q}", data=f.read(), headers={"Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                res = json.load(r)
+            stats[res.get("status") or "failed"] += 1
+        except Exception as e:
+            stats["failed"] += 1
+            if stats["failed"] <= 3:
+                print(f"failed {mid}: {e}")
+    print(f"media ({args.media}): " + ", ".join(f"{k} {v}" for k, v in stats.items()) + f"; {size / 1e6:.0f} MB")
+    if not args.apply:
+        print("dry run: nothing imported (use --apply)")
     return 0
 
 
