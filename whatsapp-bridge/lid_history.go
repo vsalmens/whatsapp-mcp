@@ -5,7 +5,8 @@ package main
 // 1) LID names: resolves @lid pseudonyms to phone numbers via whatsmeow's LID
 //    map, looks up the contact name and stores it in the lid_names table of
 //    messages.db. Also fixes chat names of 1:1 chats that only show a raw ID.
-//    Runs 20 s after start-up and every 10 minutes after that.
+//    Runs 20 s after start-up and every 10 minutes after that; /api/resolve_names
+//    resolves given senders immediately.
 //
 // 2) On-demand history: POST /api/history (history_wait_extras.go) asks the
 //    user's own phone for older messages of one chat. The request is a peer
@@ -67,6 +68,35 @@ func startExtras(client *whatsmeow.Client, store *MessageStore, logger waLog.Log
 			"resolved_lids": resolved,
 			"renamed_chats": renamed,
 		})
+	})
+
+	// Resolves the given senders now, so a new group member does not show as a raw LID
+	// until the next periodic refresh. Body: {"users": ["<LID user part>", ...]}
+	http.HandleFunc("/api/resolve_names", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeExtrasJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "POST only"})
+			return
+		}
+		var req struct {
+			Users []string `json:"users"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Users) > 200 {
+			writeExtrasJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "expected {\"users\": [...]} (max 200)"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		names := map[string]string{}
+		for _, u := range req.Users {
+			u = strings.TrimSuffix(u, "@"+types.HiddenUserServer)
+			if !isAllDigits(u) {
+				continue
+			}
+			if name, ok, _ := storeLIDName(ctx, client, store, logger, u); ok && name != "" {
+				names[u] = name
+			}
+		}
+		writeExtrasJSON(w, http.StatusOK, map[string]any{"success": true, "names": names})
 	})
 
 	go func() {
@@ -173,42 +203,49 @@ func refreshLIDNames(client *whatsmeow.Client, store *MessageStore, logger waLog
 	}
 	rows.Close()
 
-	now := time.Now()
 	for user := range candidates {
-		pn, name, ok := resolveLID(ctx, client, user)
-		if !ok {
-			continue
+		_, ok, n := storeLIDName(ctx, client, store, logger, user)
+		if ok {
+			resolved++
 		}
-		resolved++
-
-		pnUser := ""
-		if !pn.IsEmpty() {
-			pnUser = pn.User
-		}
-		if _, err := store.db.Exec(`
-			INSERT INTO lid_names (lid, pn, name, updated_at) VALUES (?, ?, ?, ?)
-			ON CONFLICT(lid) DO UPDATE SET pn = excluded.pn, name = excluded.name, updated_at = excluded.updated_at`,
-			user, pnUser, name, now); err != nil {
-			logger.Warnf("extras: failed to write lid_names (%s): %v", user, err)
-			continue
-		}
-
-		if name == "" {
-			continue
-		}
-		// Only replace names that are raw IDs; never touch manually set names
-		res, err := store.db.Exec(`
-			UPDATE chats SET name = ?
-			WHERE jid = ? AND (name IS NULL OR name = '' OR name = ? OR name = ?)`,
-			name, user+"@"+types.HiddenUserServer, user, user+"@"+types.HiddenUserServer)
-		if err == nil {
-			if n, _ := res.RowsAffected(); n > 0 {
-				renamed += int(n)
-			}
-		}
+		renamed += n
 	}
 	renamed += renamePNChats(ctx, client, store, logger)
 	return resolved, renamed
+}
+
+// storeLIDName resolves one LID user part, stores the result in lid_names and names the
+// LID chat if it still shows a raw ID. ok is false if nothing was found.
+func storeLIDName(ctx context.Context, client *whatsmeow.Client, store *MessageStore, logger waLog.Logger, user string) (name string, ok bool, renamed int) {
+	pn, name, ok := resolveLID(ctx, client, user)
+	if !ok {
+		return "", false, 0
+	}
+	pnUser := ""
+	if !pn.IsEmpty() {
+		pnUser = pn.User
+	}
+	if _, err := store.db.Exec(`
+		INSERT INTO lid_names (lid, pn, name, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(lid) DO UPDATE SET pn = excluded.pn, name = excluded.name, updated_at = excluded.updated_at`,
+		user, pnUser, name, time.Now()); err != nil {
+		logger.Warnf("extras: failed to write lid_names (%s): %v", user, err)
+		return name, true, 0
+	}
+	if name == "" {
+		return "", true, 0
+	}
+	// Only replace names that are raw IDs; never touch manually set names
+	res, err := store.db.Exec(`
+		UPDATE chats SET name = ?
+		WHERE jid = ? AND (name IS NULL OR name = '' OR name = ? OR name = ?)`,
+		name, user+"@"+types.HiddenUserServer, user, user+"@"+types.HiddenUserServer)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			renamed = int(n)
+		}
+	}
+	return name, true, renamed
 }
 
 // renamePNChats names phone-number chats that still show a raw number. Upstream names a chat

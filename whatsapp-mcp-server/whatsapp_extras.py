@@ -1,7 +1,10 @@
 """whatsapp_extras.py — extras for the lharries/whatsapp-mcp MCP server.
 
 - Replaces whatsapp.get_sender_name with a version that resolves WhatsApp LID
-  pseudonyms via the bridge's lid_names table and never matches group JIDs.
+  pseudonyms via the bridge's lid_names table (unknown ones are resolved at once via
+  /api/resolve_names) and never matches group JIDs. Mentions stored as numbers are shown as names.
+- Replaces search_contacts (also finds group members known only from lid_names),
+  get_contact_chats and get_last_interaction (match a person's phone number and LID).
 - Adds MCP tools:
     request_older_messages(chat_jid, count=50, from_newest=False)
     get_reactions(chat_jid, query=None, message_id=None, limit=5)
@@ -28,6 +31,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -50,46 +55,113 @@ SELF_NAME = "Me"
 _original_get_sender_name = _wa.get_sender_name
 
 
+def _lookup_name(conn, user: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT name FROM lid_names WHERE lid = ? AND name IS NOT NULL AND name != ''", (user,)
+    ).fetchone()
+    if row:
+        return row[0]
+    own = conn.execute(
+        "SELECT pn FROM lid_names WHERE name = ? AND pn IS NOT NULL AND pn != ''", (SELF_CHAT_NAME,)
+    ).fetchone()
+    if own and user == own[0]:
+        return SELF_NAME
+    row = conn.execute(
+        "SELECT name FROM lid_names WHERE pn = ? AND name IS NOT NULL AND name != ''", (user,)
+    ).fetchone()
+    if row:
+        return row[0]
+    row = conn.execute(
+        "SELECT name FROM chats WHERE jid IN (?, ?) AND name IS NOT NULL AND name != ''",
+        (f"{user}@s.whatsapp.net", f"{user}@lid"),
+    ).fetchone()
+    if row and row[0] != user:
+        return row[0]
+    return None
+
+
+# Senders the bridge could not resolve recently (user -> time), so misses do not call it again
+_UNRESOLVED: Dict[str, float] = {}
+_UNRESOLVED_TTL = 600
+_bridge_down_until = 0.0
+
+
+def _resolve_now(user: str) -> Optional[str]:
+    """Ask the bridge to resolve a LID now instead of waiting for its 10-minute refresh."""
+    global _bridge_down_until
+    now = time.monotonic()
+    if not user.isdigit() or now < _bridge_down_until or now - _UNRESOLVED.get(user, -1e9) < _UNRESOLVED_TTL:
+        return None
+    try:
+        resp = requests.post(f"{_wa.WHATSAPP_API_BASE_URL}/resolve_names", json={"users": [user]}, timeout=3)
+        name = (resp.json().get("names") or {}).get(user)
+    except (requests.RequestException, ValueError, AttributeError):
+        _bridge_down_until = now + 60
+        return None
+    if not name:
+        _UNRESOLVED[user] = now
+    return name or None
+
+
 def get_sender_name(sender_jid: str) -> str:
     """Display name for a sender. Avoids upstream's LIKE lookup, which also matched legacy
     group JIDs (<creator number>-<timestamp>@g.us) and could show e.g. your own reaction
-    under a group's name."""
+    under a group's name. Unknown LIDs are resolved through the bridge right away."""
     if not sender_jid:
         return sender_jid
-    user = sender_jid.split("@")[0]
+    user, _, server = sender_jid.partition("@")
     try:
         conn = sqlite3.connect(_wa.MESSAGES_DB_PATH)
         try:
-            row = conn.execute(
-                "SELECT name FROM lid_names WHERE lid = ? AND name IS NOT NULL AND name != ''", (user,)
-            ).fetchone()
-            if row:
-                return row[0]
-            own = conn.execute(
-                "SELECT pn FROM lid_names WHERE name = ? AND pn IS NOT NULL AND pn != ''", (SELF_CHAT_NAME,)
-            ).fetchone()
-            if own and user == own[0]:
-                return SELF_NAME
-            row = conn.execute(
-                "SELECT name FROM lid_names WHERE pn = ? AND name IS NOT NULL AND name != ''", (user,)
-            ).fetchone()
-            if row:
-                return row[0]
-            row = conn.execute(
-                "SELECT name FROM chats WHERE jid IN (?, ?) AND name IS NOT NULL AND name != ''",
-                (f"{user}@s.whatsapp.net", f"{user}@lid"),
-            ).fetchone()
-            if row and row[0] != user:
-                return row[0]
+            name = _lookup_name(conn, user)
         finally:
             conn.close()
     except sqlite3.Error:
         return _original_get_sender_name(sender_jid)
+    if name:
+        return name
+    if server in ("", "lid"):
+        name = _resolve_now(user)
+        if name:
+            return SELF_NAME if name == SELF_CHAT_NAME else name
     return sender_jid
+
+
+_MENTION = re.compile(r"@(\d{8,})\b")
+
+
+def resolve_mentions(text: Optional[str]) -> Optional[str]:
+    """Replace mentions stored as numbers ("@<LID or phone number>") with contact names."""
+    if not text or "@" not in text:
+        return text
+    cache: Dict[str, str] = {}
+
+    def name_of(m):
+        num = m.group(1)
+        if num not in cache:
+            cache[num] = get_sender_name(num)
+        return "@" + cache[num] if cache[num] != num else m.group(0)
+
+    return _MENTION.sub(name_of, text)
 
 
 # format_message calls the module-level get_sender_name, so patching it here is enough
 _wa.get_sender_name = get_sender_name
+
+_original_format_message = _wa.format_message
+
+
+def format_message(message, show_chat_info: bool = True):
+    """Upstream format_message with mentions shown as names."""
+    try:
+        message = replace(message, content=resolve_mentions(message.content))
+    except TypeError:
+        pass
+    return _original_format_message(message, show_chat_info)
+
+
+# format_messages_list and get_last_interaction call the module-level format_message
+_wa.format_message = format_message
 
 
 def list_chats(query: Optional[str] = None, limit: int = 20, page: int = 0,
@@ -161,6 +233,124 @@ def chat_jids(chat_jid: str) -> list:
     return jids
 
 
+def person_users(jid_or_number: str) -> List[str]:
+    """User parts under which one person appears: the given one plus its LID / phone number."""
+    user = jid_or_number.strip().split("@")[0].lstrip("+")
+    users = [user]
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            for (other,) in conn.execute(
+                    "SELECT pn FROM lid_names WHERE lid = ? AND pn != '' UNION "
+                    "SELECT lid FROM lid_names WHERE pn = ? AND lid != ''", (user, user)):
+                if other and other not in users:
+                    users.append(other)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return users
+
+
+def person_senders(jid_or_number: str) -> List[str]:
+    """Values the messages.sender column can hold for one person (the bridge stores the bare
+    user part for live messages and the full JID for history syncs)."""
+    return [v for u in person_users(jid_or_number) for v in (u, f"{u}@lid", f"{u}@s.whatsapp.net")]
+
+
+def person_chats(jid_or_number: str) -> List[str]:
+    """The person's 1:1 chat JIDs (phone number and LID)."""
+    return [j for u in person_users(jid_or_number) for j in (f"{u}@s.whatsapp.net", f"{u}@lid")]
+
+
+def search_contacts(query: str):
+    """Upstream search_contacts, plus people known only from groups (lid_names), e.g. group
+    members you have never chatted with directly. A person is listed once."""
+    pattern = f"%{query}%"
+    result, seen = [], set()
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            chats = conn.execute(
+                "SELECT jid, name FROM chats WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?)) "
+                "AND jid NOT LIKE '%@g.us' ORDER BY name, jid LIMIT 50", (pattern, pattern)).fetchall()
+            known = conn.execute(
+                "SELECT lid, pn, name FROM lid_names WHERE name != '' AND name != ? AND "
+                "(LOWER(name) LIKE LOWER(?) OR pn LIKE ? OR lid LIKE ?) ORDER BY name LIMIT 50",
+                (SELF_CHAT_NAME, pattern, pattern, pattern)).fetchall()
+            alt = {}
+            for lid, pn in conn.execute("SELECT lid, pn FROM lid_names WHERE pn != ''"):
+                alt[f"{lid}@lid"], alt[f"{pn}@s.whatsapp.net"] = f"{pn}@s.whatsapp.net", f"{lid}@lid"
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return _wa.search_contacts(query)
+    for jid, name in chats:
+        if jid in seen:
+            continue
+        seen.update((jid, alt.get(jid, jid)))
+        result.append(_wa.Contact(phone_number=jid.split("@")[0], name=name, jid=jid))
+    for lid, pn, name in known:
+        jid = f"{pn}@s.whatsapp.net" if pn else f"{lid}@lid"
+        if jid in seen or f"{lid}@lid" in seen:
+            continue
+        seen.update((jid, f"{lid}@lid"))
+        result.append(_wa.Contact(phone_number=pn or lid, name=name, jid=jid))
+    return result[:50]
+
+
+def get_contact_chats(jid: str, limit: int = 20, page: int = 0):
+    """Upstream get_contact_chats, but matches the person under both their phone number and LID,
+    and returns each chat once with its latest message."""
+    senders, chats = person_senders(jid), person_chats(jid)
+    sm, cm = ",".join("?" * len(senders)), ",".join("?" * len(chats))
+    sql = f"""
+        SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me
+        FROM chats c
+        LEFT JOIN messages m ON m.rowid = (
+            SELECT rowid FROM messages WHERE chat_jid = c.jid ORDER BY timestamp DESC LIMIT 1)
+        WHERE c.jid IN ({cm}) OR c.jid IN (SELECT DISTINCT chat_jid FROM messages WHERE sender IN ({sm}))
+        ORDER BY c.last_message_time DESC
+        LIMIT ? OFFSET ?"""
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(sql, chats + senders + [limit, page * limit]).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    return [_wa.Chat(jid=r[0], name=r[1], last_message_time=datetime.fromisoformat(r[2]) if r[2] else None,
+                     last_message=r[3], last_sender=r[4], last_is_from_me=r[5]) for r in rows]
+
+
+def get_last_interaction(jid: str):
+    """Upstream get_last_interaction, matching the person under both their phone number and LID."""
+    senders, chats = person_senders(jid), person_chats(jid)
+    sm, cm = ",".join("?" * len(senders)), ",".join("?" * len(chats))
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            r = conn.execute(
+                f"SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type "
+                f"FROM messages m JOIN chats c ON m.chat_jid = c.jid "
+                f"WHERE m.sender IN ({sm}) OR m.chat_jid IN ({cm}) ORDER BY m.timestamp DESC LIMIT 1",
+                senders + chats).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not r:
+        return None
+    return _wa.format_message(_wa.Message(timestamp=datetime.fromisoformat(r[0]), sender=r[1], chat_name=r[2],
+                                          content=r[3], is_from_me=r[4], chat_jid=r[5], id=r[6], media_type=r[7]))
+
+
+_wa.search_contacts = search_contacts
+_wa.get_contact_chats = get_contact_chats
+_wa.get_last_interaction = get_last_interaction
+
+
 def list_messages(after: Optional[str] = None, before: Optional[str] = None,
                   sender_phone_number: Optional[str] = None, chat_jid: Optional[str] = None,
                   query: Optional[str] = None, limit: int = 20, page: int = 0,
@@ -172,7 +362,8 @@ def list_messages(after: Optional[str] = None, before: Optional[str] = None,
     if before:
         where.append("messages.timestamp < ?"); params.append(datetime.fromisoformat(before))
     if sender_phone_number:
-        where.append("messages.sender = ?"); params.append(sender_phone_number)
+        senders = person_senders(sender_phone_number)
+        where.append(f"messages.sender IN ({','.join('?' * len(senders))})"); params += senders
     if chat_jid:
         jids = chat_jids(chat_jid)
         marks = ",".join("?" * len(jids))
@@ -295,6 +486,7 @@ def _register_tools(mcp) -> None:
     _register_download(mcp)
     _register_list_chats(mcp)
     _register_list_messages(mcp)
+    _register_contact_tools(mcp)
 
     @mcp.tool()
     def request_older_messages(chat_jid: str, count: int = 50, from_newest: bool = False,
@@ -395,7 +587,7 @@ def _register_tools(mcp) -> None:
                     "message_id": mid,
                     "time": ts,
                     "from": _wa.get_sender_name(sender or ""),
-                    "preview": (content or "")[:160],
+                    "preview": (resolve_mentions(content) or "")[:160],
                     "reactions": {e: {"count": len(n), "by": n} for e, n in by_emoji.items()},
                     "total": sum(len(n) for n in by_emoji.values()),
                 }
@@ -472,7 +664,7 @@ def _register_tools(mcp) -> None:
                     if sender not in names:
                         names[sender] = _wa.get_sender_name(sender or "")
                     who = names[sender]
-                body = (content or "").replace("\n", " / ")
+                body = (resolve_mentions(content) or "").replace("\n", " / ")
                 if mtype:
                     body = f"[{mtype}] {body}".strip()
                 if mid in reacts:
@@ -586,6 +778,42 @@ def _register_list_chats(mcp) -> None:
                               include_last_message=include_last_message, sort_by=sort_by)
 
 
+def _register_contact_tools(mcp) -> None:
+    # main.py imported the upstream functions by name, so replace the tools, not just the functions
+    for name in ("search_contacts", "get_contact_chats", "get_last_interaction"):
+        _remove_tool(mcp, name)
+
+    @mcp.tool()
+    def search_contacts(query: str):
+        """Search WhatsApp contacts by name or phone number, including group members you have
+        never chatted with directly.
+
+        Args:
+            query: Search term to match against contact names or phone numbers
+        """
+        return _wa.search_contacts(query)
+
+    @mcp.tool()
+    def get_contact_chats(jid: str, limit: int = 20, page: int = 0):
+        """Get all WhatsApp chats involving the contact (direct chat and groups where they wrote).
+
+        Args:
+            jid: The contact's JID or phone number (its LID / phone-number twin is matched too)
+            limit: Maximum number of chats to return (default 20)
+            page: Page number for pagination (default 0)
+        """
+        return _wa.get_contact_chats(jid, limit, page)
+
+    @mcp.tool()
+    def get_last_interaction(jid: str) -> str:
+        """Get most recent WhatsApp message involving the contact.
+
+        Args:
+            jid: The contact's JID or phone number (its LID / phone-number twin is matched too)
+        """
+        return _wa.get_last_interaction(jid)
+
+
 def _register_list_messages(mcp) -> None:
     # main.py imported upstream list_messages by name, so replace the tool, not just the function
     _remove_tool(mcp, "list_messages")
@@ -602,7 +830,7 @@ def _register_list_messages(mcp) -> None:
         Args:
             after: Optional ISO-8601 formatted string to only return messages after this date
             before: Optional ISO-8601 formatted string to only return messages before this date
-            sender_phone_number: Optional phone number to filter messages by sender
+            sender_phone_number: Optional phone number or JID to filter messages by sender (LID twin matched too)
             chat_jid: Optional chat JID to filter messages by chat
             query: Optional search term to filter messages by content
             limit: Maximum number of messages to return (default 20)

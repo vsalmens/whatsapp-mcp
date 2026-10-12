@@ -5,7 +5,7 @@ separate files so that upstream changes and fixes from other forks merge with fe
 
 | Area | What changes |
 |---|---|
-| **Names** | `@lid` pseudonyms resolved to contact names (`lid_names` table); your own chat shows as *Me (note to self)*; sender lookup no longer mis-matches legacy group JIDs |
+| **Names** | `@lid` pseudonyms resolved to contact names (`lid_names` table), new senders at once (`/api/resolve_names`); mentions stored as numbers shown as names; your own chat shows as *Me (note to self)*; sender lookup no longer mis-matches legacy group JIDs; contact search finds group-only members and person lookups match both phone number and LID |
 | **History** | On-demand history from your phone (`/api/history`, tool `request_older_messages`), anchored on the oldest or newest stored message; reports what the phone answered (received / exhausted / no response) and retries other anchors; `scripts/backfill-history.sh` for bulk runs |
 | **Chat exports** | WhatsApp gives linked devices only part of a chat's history on demand (the phone answers "more remain on the phone"); that limit is recorded per chat and explained to the user. Older history can be imported from the phone's *Export chat* file via a configured folder (tools `list_chat_exports`, `import_chat_export`) |
 | **Media** | Files named by message ID (upstream names collide); fixed downloads (the signed query string is kept — upstream strips it and gets 403), automatic *media retry* via the phone for expired media; images returned inline, document text / local transcription / raw file on request |
@@ -34,7 +34,7 @@ on `127.0.0.1`.
 
 | File | Purpose |
 |---|---|
-| `whatsapp-bridge/lid_history.go` | `startExtras()` entry point, LID names, `/api/refresh_names` |
+| `whatsapp-bridge/lid_history.go` | `startExtras()` entry point, LID names, `/api/refresh_names`, `/api/resolve_names` |
 | `whatsapp-bridge/history_wait_extras.go` | `/api/history`: waits for the phone's answer, anchor and LID/PN fallbacks; chat last-message-time repair |
 | `whatsapp-bridge/media_import_extras.go` | `/api/import_media`: media files from an import (iPhone backup), stored where `download_media` finds them |
 | `whatsapp-bridge/session_extras.go` | Exits after the phone logs the device out, so launchd restarts the bridge into QR mode |
