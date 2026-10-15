@@ -352,7 +352,7 @@ _wa.get_last_interaction = get_last_interaction
 
 
 def reaction_labels(messages) -> Dict[str, str]:
-    """Message ID -> compact reaction label, e.g. "❤️ Me; 👍 Anna, Ben; 😂×5"."""
+    """Message ID -> reaction label, e.g. "❤️ Me; 👍 Anna, Ben +2; 😂×3" (+N / ×N = senders without a name)."""
     ids = list({m.id for m in messages if m.id})
     if not ids:
         return {}
@@ -383,7 +383,13 @@ def reaction_labels(messages) -> Dict[str, str]:
             names.append(name)
     labels = {}
     for mid, by_emoji in by_msg.items():
-        parts = [f"{e}×{len(n)}" if len(n) > 3 else f"{e} {', '.join(n)}" for e, n in by_emoji.items()]
+        parts = []
+        for emoji, names in by_emoji.items():
+            # Known people by name; senders without a name (raw JID) only as a count
+            known = [n for n in names if "@" not in n and not n.isdigit()]
+            unknown = len(names) - len(known)
+            who = ", ".join(known) + (f" +{unknown}" if known and unknown else "")
+            parts.append(f"{emoji} {who}" if known else f"{emoji}×{unknown}")
         labels[mid] = "; ".join(parts)
     return labels
 
@@ -877,7 +883,8 @@ def _register_list_messages(mcp) -> None:
         """Get WhatsApp messages matching specified criteria with optional context.
 
         A 1:1 chat stored under both the contact's phone number and LID is listed as one chat.
-        Reactions are shown after the message text, e.g. "[❤️ Me; 👍 Anna]" (×N when more than 3).
+        Reactions are shown after the message text with reactor names, e.g. "[❤️ Me; 👍 Anna, Ben +2]"
+        (+N / ×N = reactors without a known name; get_reactions gives full details).
 
         Args:
             after: Optional ISO-8601 formatted string to only return messages after this date
