@@ -351,6 +351,52 @@ _wa.get_contact_chats = get_contact_chats
 _wa.get_last_interaction = get_last_interaction
 
 
+def reaction_labels(messages) -> Dict[str, str]:
+    """Message ID -> compact reaction label, e.g. "❤️ Me; 👍 Anna, Ben; 😂×5"."""
+    ids = list({m.id for m in messages if m.id})
+    if not ids:
+        return {}
+    allowed: Dict[str, set] = {}
+    for m in messages:
+        if m.chat_jid not in allowed:
+            allowed[m.chat_jid] = set(chat_jids(m.chat_jid))
+    chats_of: Dict[str, set] = {}
+    for m in messages:
+        chats_of.setdefault(m.id, set()).update(allowed[m.chat_jid])
+    try:
+        conn = sqlite3.connect(f"file:{_wa.MESSAGES_DB_PATH}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                f"SELECT message_id, chat_jid, emoji, sender FROM reactions WHERE message_id IN ({','.join('?' * len(ids))}) "
+                "ORDER BY timestamp", ids).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    by_msg: Dict[str, Dict[str, list]] = {}
+    for mid, cjid, emoji, sender in rows:
+        if cjid not in chats_of.get(mid, ()):
+            continue
+        names = by_msg.setdefault(mid, {}).setdefault(emoji, [])
+        name = _wa.get_sender_name(sender)
+        if name not in names:
+            names.append(name)
+    labels = {}
+    for mid, by_emoji in by_msg.items():
+        parts = [f"{e}×{len(n)}" if len(n) > 3 else f"{e} {', '.join(n)}" for e, n in by_emoji.items()]
+        labels[mid] = "; ".join(parts)
+    return labels
+
+
+def with_reactions(messages) -> list:
+    """Messages with their reactions appended to the content, e.g. "text [❤️ Me]"."""
+    labels = reaction_labels(messages)
+    if not labels:
+        return messages
+    return [replace(m, content=f"{m.content or ''} [{labels[m.id]}]".lstrip()) if m.id in labels else m
+            for m in messages]
+
+
 def list_messages(after: Optional[str] = None, before: Optional[str] = None,
                   sender_phone_number: Optional[str] = None, chat_jid: Optional[str] = None,
                   query: Optional[str] = None, limit: int = 20, page: int = 0,
@@ -391,9 +437,9 @@ def list_messages(after: Optional[str] = None, before: Optional[str] = None,
         for msg in result:
             ctx = _wa.get_message_context(msg.id, context_before, context_after)
             out += ctx.before + [ctx.message] + ctx.after
-        text = _wa.format_messages_list(out, show_chat_info=True)
+        text = _wa.format_messages_list(with_reactions(out), show_chat_info=True)
     else:
-        text = _wa.format_messages_list(result, show_chat_info=True)
+        text = _wa.format_messages_list(with_reactions(result), show_chat_info=True)
     if chat_jid and len(result) < limit:
         note = history_limit_note(chat_jid, after)
         if note:
@@ -556,30 +602,35 @@ def _register_tools(mcp) -> None:
         try:
             conn = sqlite3.connect(_wa.MESSAGES_DB_PATH)
             cur = conn.cursor()
+            # Messages and reactions may be stored under either JID of a contact (LID / phone number)
+            jids = chat_jids(chat_jid)
+            in_jids = f"({','.join('?' * len(jids))})"
             if message_id:
-                cur.execute("SELECT id, sender, content, timestamp FROM messages WHERE chat_jid=? AND id=?",
-                            (chat_jid, message_id))
+                cur.execute(f"SELECT id, sender, content, timestamp FROM messages WHERE chat_jid IN {in_jids} AND id=? LIMIT 1",
+                            (*jids, message_id))
             elif query:
-                cur.execute("""SELECT id, sender, content, timestamp FROM messages
-                               WHERE chat_jid=? AND content LIKE ? ORDER BY timestamp DESC LIMIT ?""",
-                            (chat_jid, f"%{query}%", limit))
+                cur.execute(f"""SELECT id, sender, content, timestamp FROM messages
+                               WHERE chat_jid IN {in_jids} AND content LIKE ? GROUP BY id ORDER BY timestamp DESC LIMIT ?""",
+                            (*jids, f"%{query}%", limit))
             else:
-                cur.execute("""SELECT m.id, m.sender, m.content, m.timestamp FROM messages m
-                               WHERE m.chat_jid=? AND EXISTS (SELECT 1 FROM reactions r
-                                 WHERE r.chat_jid=m.chat_jid AND r.message_id=m.id)
-                               ORDER BY m.timestamp DESC LIMIT ?""", (chat_jid, limit))
+                cur.execute(f"""SELECT m.id, m.sender, m.content, m.timestamp FROM messages m
+                               WHERE m.chat_jid IN {in_jids} AND EXISTS (SELECT 1 FROM reactions r
+                                 WHERE r.chat_jid IN {in_jids} AND r.message_id=m.id)
+                               GROUP BY m.id ORDER BY m.timestamp DESC LIMIT ?""", (*jids, *jids, limit))
             msgs = cur.fetchall()
             out = []
             for mid, sender, content, ts in msgs:
-                cur.execute("SELECT emoji, sender, timestamp FROM reactions WHERE chat_jid=? AND message_id=? ORDER BY timestamp",
-                            (chat_jid, mid))
+                cur.execute(f"SELECT emoji, sender, timestamp FROM reactions WHERE chat_jid IN {in_jids} AND message_id=? ORDER BY timestamp",
+                            (*jids, mid))
                 by_emoji: Dict[str, list] = {}
                 for emoji, rsender, rts in cur.fetchall():
-                    by_emoji.setdefault(emoji, []).append({"name": _wa.get_sender_name(rsender), "time": rts})
+                    name = _wa.get_sender_name(rsender)
+                    if all(r["name"] != name for r in by_emoji.get(emoji, [])):
+                        by_emoji.setdefault(emoji, []).append({"name": name, "time": rts})
                 versions = []
                 try:
-                    cur.execute("SELECT version, content, edited_at FROM message_edits WHERE chat_jid=? AND message_id=? ORDER BY version",
-                                (chat_jid, mid))
+                    cur.execute(f"SELECT version, content, edited_at FROM message_edits WHERE chat_jid IN {in_jids} AND message_id=? ORDER BY version",
+                                (*jids, mid))
                     versions = [{"version": v, "time": t, "text": (c or "")[:300]} for v, c, t in cur.fetchall()]
                 except sqlite3.Error:
                     pass
@@ -592,8 +643,8 @@ def _register_tools(mcp) -> None:
                     "total": sum(len(n) for n in by_emoji.values()),
                 }
                 try:
-                    cur.execute("""SELECT sender, emoji, timestamp FROM reaction_events
-                                   WHERE chat_jid=? AND message_id=? ORDER BY timestamp""", (chat_jid, mid))
+                    cur.execute(f"""SELECT sender, emoji, timestamp FROM reaction_events
+                                   WHERE chat_jid IN {in_jids} AND message_id=? ORDER BY timestamp""", (*jids, mid))
                     per_sender: Dict[str, list] = {}
                     for rsender, emoji, rts in cur.fetchall():
                         per_sender.setdefault(rsender, []).append({"emoji": emoji or "(poistettu)", "time": rts})
@@ -826,6 +877,7 @@ def _register_list_messages(mcp) -> None:
         """Get WhatsApp messages matching specified criteria with optional context.
 
         A 1:1 chat stored under both the contact's phone number and LID is listed as one chat.
+        Reactions are shown after the message text, e.g. "[❤️ Me; 👍 Anna]" (×N when more than 3).
 
         Args:
             after: Optional ISO-8601 formatted string to only return messages after this date
