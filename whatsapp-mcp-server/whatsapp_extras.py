@@ -118,12 +118,11 @@ def get_sender_name(sender_jid: str) -> str:
             conn.close()
     except sqlite3.Error:
         return _original_get_sender_name(sender_jid)
-    if name:
-        return name
-    if server in ("", "lid"):
+    if not name and server in ("", "lid"):
         name = _resolve_now(user)
-        if name:
-            return SELF_NAME if name == SELF_CHAT_NAME else name
+    if name:
+        # The bridge names the user's own LID after the self chat; as a sender it is just "Me"
+        return SELF_NAME if name == SELF_CHAT_NAME else name
     return sender_jid
 
 
