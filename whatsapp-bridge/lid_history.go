@@ -235,10 +235,12 @@ func storeLIDName(ctx context.Context, client *whatsmeow.Client, store *MessageS
 	if name == "" {
 		return "", true, 0
 	}
-	// Only replace names that are raw IDs; never touch manually set names
+	// Only replace names that are raw IDs; never touch manually set names. A bare number is
+	// also a raw ID: upstream names a new chat after the sender, which is the user's own LID
+	// when the first message in the chat was the user's.
 	res, err := store.db.Exec(`
 		UPDATE chats SET name = ?
-		WHERE jid = ? AND (name IS NULL OR name = '' OR name = ? OR name = ?)`,
+		WHERE jid = ? AND (name IS NULL OR name = '' OR name = ? OR name = ? OR name NOT GLOB '*[^0-9]*')`,
 		name, user+"@"+types.HiddenUserServer, user, user+"@"+types.HiddenUserServer)
 	if err == nil {
 		if n, _ := res.RowsAffected(); n > 0 {
@@ -254,7 +256,7 @@ func storeLIDName(ctx context.Context, client *whatsmeow.Client, store *MessageS
 func renamePNChats(ctx context.Context, client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) (renamed int) {
 	rows, err := store.db.Query(`
 		SELECT jid FROM chats
-		WHERE jid LIKE '%@' || ? AND (name IS NULL OR name = '' OR name = jid OR name = substr(jid, 1, instr(jid, '@') - 1))`,
+		WHERE jid LIKE '%@' || ? AND (name IS NULL OR name = '' OR name = jid OR name NOT GLOB '*[^0-9]*')`,
 		types.DefaultUserServer)
 	if err != nil {
 		logger.Warnf("extras: failed to query unnamed chats: %v", err)
@@ -282,8 +284,8 @@ func renamePNChats(ctx context.Context, client *whatsmeow.Client, store *Message
 		}
 		res, err := store.db.Exec(`
 			UPDATE chats SET name = ?
-			WHERE jid = ? AND (name IS NULL OR name = '' OR name = jid OR name = ?)`,
-			name, jid.String(), jid.User)
+			WHERE jid = ? AND (name IS NULL OR name = '' OR name = jid OR name NOT GLOB '*[^0-9]*')`,
+			name, jid.String())
 		if err == nil {
 			if n, _ := res.RowsAffected(); n > 0 {
 				renamed += int(n)
