@@ -11,6 +11,7 @@ separate files so that upstream changes and fixes from other forks merge with fe
 | **Media** | Files named by message ID (upstream names collide); fixed downloads (the signed query string is kept — upstream strips it and gets 403), automatic *media retry* via the phone for expired media; images returned inline, document text / local transcription / raw file on request |
 | **Reactions** | Stored live and from history syncs, including the newer *message add-on* format; current state (`reactions`) plus an append-only change log (`reaction_events`) |
 | **Edits** | Edited messages are versioned (`message_edits`: version 0 = original, 1.. = edits with edit timestamps); reactions on edit wrappers are attached to the original message |
+| **Deletions** | *Delete for everyone* is recorded (`message_revokes`: who, when, live or from history); the message row stays, `export_chat_text` shows the line as deleted and `message_details` flags it |
 | **Bulk reading** | Tool `export_chat_text` exports a chat as compact chronological text in chunks — for summaries and overall analyses |
 | **Remote use** | MCP server can run over streamable HTTP (`MCP_TRANSPORT=http`) with Host-header checks; macOS launchd setup in `scripts/setup-macos-service.sh` |
 | **Safety** | Bridge REST API bound to `127.0.0.1`; `host_guard.go` refuses to run the same device keys on a second machine; send tools can stay disabled |
@@ -45,6 +46,7 @@ on `127.0.0.1`.
 | `whatsapp-bridge/history_ondemand_extras.go` | Logs on-demand answers (end-of-history flags) and hands them to waiting requests |
 | `whatsapp-bridge/media_extras.go` | `/api/download2` with media retry |
 | `whatsapp-bridge/reactions_extras.go` | Reactions, reaction change log, edit versioning, debug helpers |
+| `whatsapp-bridge/revokes_extras.go` | *Delete for everyone* events (`message_revokes`) |
 | `whatsapp-bridge/host_guard.go` | Device-key owner check (`store/.host`) |
 | `whatsapp-mcp-server/whatsapp_extras.py` | MCP tools and fixes listed above |
 | `scripts/setup-macos-service.sh` | Build + launchd services (bridge, MCP over HTTP) |
@@ -93,6 +95,7 @@ text into its context. Keep permission prompts on and the send tools disabled.
 | `reactions` | current reaction per (`chat_jid`, `message_id`, `sender`) |
 | `reaction_events` | every observed reaction / change / removal (`emoji = ''`), with `source` = live/history |
 | `message_edits` | `version` 0 = original, 1.. = edits, with `edited_at` |
+| `message_revokes` | one row per message deleted for everyone: `revoked_by`, `revoked_at` (from history: the message's own time), `source` |
 
 Change history for reactions is only complete for changes the bridge sees live; history
 syncs contain only the current reaction per person.

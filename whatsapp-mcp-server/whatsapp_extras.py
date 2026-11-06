@@ -661,6 +661,14 @@ def _register_tools(mcp) -> None:
                 if versions:
                     item["edited"] = True
                     item["versions"] = versions  # 0 = original, 1.. = edits
+                try:
+                    cur.execute(f"SELECT revoked_by, revoked_at FROM message_revokes WHERE chat_jid IN {in_jids} AND message_id=?",
+                                (*jids, mid))
+                    revoked = cur.fetchone()
+                    if revoked:
+                        item["deleted"] = {"by": _wa.get_sender_name(revoked[0] or ""), "time": revoked[1]}  # deleted for everyone; the archive keeps the text
+                except sqlite3.Error:
+                    pass
                 out.append(item)
             conn.close()
             return {"success": True, "messages": out,
@@ -701,6 +709,11 @@ def _register_tools(mcp) -> None:
                 q += " AND timestamp < ?"; args.append(before)
             total = conn.execute(q.replace("SELECT id, timestamp, sender, content, media_type, is_from_me", "SELECT COUNT(*)"), args).fetchone()[0]
             rows = conn.execute(q + " ORDER BY timestamp ASC LIMIT -1 OFFSET ?", args + [offset]).fetchall()
+            deleted: set = set()
+            try:
+                deleted = {mid for (mid,) in conn.execute(f"SELECT message_id FROM message_revokes WHERE chat_jid IN {in_jids}", jids)}
+            except sqlite3.Error:
+                pass
             reacts: Dict[str, str] = {}
             if include_reactions:
                 try:
@@ -723,6 +736,8 @@ def _register_tools(mcp) -> None:
                 body = (resolve_mentions(content) or "").replace("\n", " / ")
                 if mtype:
                     body = f"[{mtype}] {body}".strip()
+                if mid in deleted:
+                    body = "[deleted for everyone]"  # the phone shows no text either; message_details has it
                 if mid in reacts:
                     body += f" ⟨{reacts[mid]}⟩"
                 line = f"{str(ts)[:16]} {who}: {body}"
