@@ -19,6 +19,9 @@ A fork of lharries/whatsapp-mcp with extras (see EXTRAS.md):
 - Never commit logs, `.env` files or anything containing message content, phone numbers,
   host names or personal data. Keep code, comments and docs in English.
 - Do not enable or add message-sending tools unless explicitly asked.
+  The bridge has no send route: `/api/send` and its client code were removed (any local process
+  could send text or any local file through it, with no approval and no audit). The send helpers in
+  `whatsapp-mcp-server/whatsapp.py` and the commented-out tools in `main.py` therefore have nothing to call.
 - Do not add the WhatsApp MCP server to Claude Code in this repository (message content and
   shell access should never share a session).
 
